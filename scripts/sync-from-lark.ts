@@ -42,8 +42,8 @@ import { execSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
-  readFileSync,
   readdirSync,
+  readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -133,7 +133,7 @@ function lark(args: string[], timeoutMs = 90_000): string {
     const stderr =
       typeof err.stderr === "string"
         ? err.stderr
-        : err.stderr?.toString("utf8") ?? "";
+        : (err.stderr?.toString("utf8") ?? "");
     throw new Error(
       stderr.trim() ? `${err.message}\n${stderr.trim()}` : err.message,
     );
@@ -260,7 +260,9 @@ function slugify(title: string): string {
  */
 function extractSlugFromBody(rawMd: string): string | null {
   const head = rawMd.slice(0, 2048);
-  const m = head.match(/(?:^|\n)\s*(?:>\s*)?slug:\s*([A-Za-z0-9_\-./]+)\s*(?:\n|$)/);
+  const m = head.match(
+    /(?:^|\n)\s*(?:>\s*)?slug:\s*([A-Za-z0-9_\-./]+)\s*(?:\n|$)/,
+  );
   return m ? m[1].trim().replace(/^\/+|\/+$/g, "") : null;
 }
 
@@ -335,16 +337,15 @@ function loadBitableSlugMap(): Map<string, string> {
  */
 function extractLarkTokens(url: string): string[] {
   const out: string[] = [];
-  for (const m of url.matchAll(/\bfeishu\.cn\/(?:wiki|docx)\/([A-Za-z0-9]+)/g)) {
+  for (const m of url.matchAll(
+    /\bfeishu\.cn\/(?:wiki|docx)\/([A-Za-z0-9]+)/g,
+  )) {
     out.push(m[1]);
   }
   return out;
 }
 
-function hasIgnoredAncestor(
-  node: Node,
-  byToken: Map<string, Node>,
-): boolean {
+function hasIgnoredAncestor(node: Node, byToken: Map<string, Node>): boolean {
   let cur = byToken.get(node.parent_node_token);
   while (cur) {
     if (IGNORED_TOKENS.has(cur.node_token)) return true;
@@ -487,7 +488,10 @@ function transformDocxMarkdown(
 
   // 1c. If the user added `slug: foo` near the top, strip it from the body
   //     (we already consumed it for the URL; no need to render it).
-  md = md.replace(/(?:^|\n)\s*(?:>\s*)?slug:\s*[A-Za-z0-9_\-./]+\s*(?=\n|$)/, "");
+  md = md.replace(
+    /(?:^|\n)\s*(?:>\s*)?slug:\s*[A-Za-z0-9_\-./]+\s*(?=\n|$)/,
+    "",
+  );
 
   // 2. Map image tokens by parsing xml. Order is preserved.
   const xmlImgTokens: string[] = [];
@@ -548,14 +552,11 @@ function transformDocxMarkdown(
   // 6. Embedded bitable — render the first table as an inline markdown
   //     table. Other embeds (sheet/whiteboard/mindnote/slides/file) stay as
   //     a hint blockquote pointing at the original.
-  md = md.replace(
-    /<bitable\b([^>]*?)\/>/g,
-    (_match, attrs: string) => {
-      const token = extractAttr(attrs, "token");
-      if (!token) return "\n> 飞书多维表格嵌入块缺少 token\n";
-      return renderBitableEmbed(token);
-    },
-  );
+  md = md.replace(/<bitable\b([^>]*?)\/>/g, (_match, attrs: string) => {
+    const token = extractAttr(attrs, "token");
+    if (!token) return "\n> 飞书多维表格嵌入块缺少 token\n";
+    return renderBitableEmbed(token);
+  });
   md = md.replace(
     /<bitable\b([^>]*?)>[\s\S]*?<\/bitable>/g,
     (_match, attrs: string) => {
@@ -696,7 +697,7 @@ function parseShareRecordsMd(rawTable: string): ShareRecord[] {
     // pipes only, then unescape each cell.
     const cells = splitMarkdownTableRow(line)
       .slice(1, -1) // drop the empty edges from leading/trailing `|`
-      .slice(1)     // drop the record-id column
+      .slice(1) // drop the record-id column
       .map((c) => c.trim());
     if (cells.every((c) => /^-+$/.test(c))) continue;
     if (!header) {
@@ -968,10 +969,7 @@ function maybeWriteFolderMeta(
     console.log(`[sync] (dry) meta ${folderRel}/meta.json`);
     return;
   }
-  const pages = [
-    ...(containerHasIndex ? ["index"] : []),
-    ...childrenSlugs,
-  ];
+  const pages = [...(containerHasIndex ? ["index"] : []), ...childrenSlugs];
   const meta = {
     title: container.title.trim(),
     defaultOpen: true,
@@ -1012,7 +1010,9 @@ async function main() {
 
   console.log("[sync] 拉取分享归档 bitable (slug 来源)…");
   const bitableSlugByToken = loadBitableSlugMap();
-  console.log(`[sync] bitable 命中 ${bitableSlugByToken.size} 个 token → slug 映射`);
+  console.log(
+    `[sync] bitable 命中 ${bitableSlugByToken.size} 个 token → slug 映射`,
+  );
 
   const byToken = new Map<string, Node>();
   for (const n of nodes) byToken.set(n.node_token, n);
@@ -1147,7 +1147,11 @@ async function main() {
       skippedNoSlug++;
       continue;
     }
-    const slug = tokenToSlug.get(p.node.node_token)!;
+    const slug = tokenToSlug.get(p.node.node_token);
+    if (!slug) {
+      skippedNoSlug++;
+      continue;
+    }
     p.targetRel = p.node.has_child
       ? [...parents, slug, "index.mdx"].join("/")
       : [...parents, `${slug}.mdx`].join("/");
@@ -1171,8 +1175,7 @@ async function main() {
     // (the new one is written below). If the doc is up-to-date, move the
     // file with renameSync so we don't lose content for nodes that didn't
     // need a re-fetch.
-    const isRename =
-      existing !== undefined && existing.path !== p.targetRel;
+    const isRename = existing !== undefined && existing.path !== p.targetRel;
     if (isRename) {
       console.log(`[sync] rename: ${existing.path} → ${p.targetRel}`);
       renamedFromOld++;
@@ -1266,9 +1269,7 @@ async function main() {
   if (slugRenames.size > 0) {
     const updated = rewriteMetaJsonReferences(slugRenames, opts);
     if (updated.length > 0) {
-      console.log(
-        `[sync] meta.json 自动更新 ${updated.length} 处 slug 引用:`,
-      );
+      console.log(`[sync] meta.json 自动更新 ${updated.length} 处 slug 引用:`);
       for (const u of updated) console.log(`        ${u}`);
     }
   }
@@ -1314,7 +1315,7 @@ function collectSlugRenames(
   const renames = new Map<string, string>();
   for (const f of existingFiles) {
     const p = pending.find((x) => x.node.obj_token === f.feishuToken);
-    if (!p || !p.targetRel || p.targetRel === f.path) continue;
+    if (!p?.targetRel || p.targetRel === f.path) continue;
     const oldSegs = f.path.split("/");
     const newSegs = p.targetRel.split("/");
     if (oldSegs.length !== newSegs.length) continue;

@@ -184,7 +184,9 @@ function triggerDownload(blob: Blob, filename: string) {
 }
 
 function withXmlHeader(svg: string): string {
-  return svg.startsWith("<?xml") ? svg : `<?xml version="1.0" encoding="UTF-8"?>\n${svg}`;
+  return svg.startsWith("<?xml")
+    ? svg
+    : `<?xml version="1.0" encoding="UTF-8"?>\n${svg}`;
 }
 
 /**
@@ -232,9 +234,7 @@ function prepareSvgForRaster(svg: string): {
 } {
   let width = 800;
   let height = 600;
-  const viewBox = svg.match(
-    /\bviewBox\s*=\s*"([\d.\-\s]+)"/i,
-  );
+  const viewBox = svg.match(/\bviewBox\s*=\s*"([\d.\-\s]+)"/i);
   if (viewBox) {
     const parts = viewBox[1].split(/\s+/).map(Number);
     if (parts.length === 4 && parts.every((n) => Number.isFinite(n))) {
