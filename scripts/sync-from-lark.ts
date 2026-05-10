@@ -766,6 +766,58 @@ function frontmatter(
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * Escape a string so it's safe as a double-quoted MDX/JSX attribute value.
+ * Covers `"`, `<`, `>`, `&`, `{`, `}` — the chars MDX parses specially in
+ * attribute context. Newlines collapse to single spaces (cards are one-liners).
+ */
+function escapeMdxAttr(s: string): string {
+  return s
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\{/g, "&#123;")
+    .replace(/\}/g, "&#125;");
+}
+
+/**
+ * Build the `<Cards>` block that container index pages append to summarize
+ * their direct children. Each child becomes one `<Card>` linking to its page,
+ * with title and description sourced from frontmatter (description comes via
+ * descByToken — populated from freshly rendered bodies for synced entries
+ * and from existing frontmatter for up-to-date ones).
+ *
+ * Returns "" when the container has no card-eligible children — caller falls
+ * back to the placeholder hint blockquote.
+ */
+function buildContainerCardsBlock(
+  childrenWiki: Node[],
+  tokenToSlug: Map<string, string>,
+  descByToken: Map<string, string>,
+  containerTargetRel: string,
+): string {
+  // containerTargetRel like "第一次分享会/index.mdx" → parents = ["第一次分享会"]
+  const parentSegs = containerTargetRel.split("/").slice(0, -1);
+  const cards: string[] = [];
+  for (const child of childrenWiki) {
+    if (IGNORED_TOKENS.has(child.node_token)) continue;
+    if (child.obj_type !== "docx") continue;
+    const slug = tokenToSlug.get(child.node_token);
+    if (!slug) continue;
+    const title = escapeMdxAttr(child.title.trim());
+    if (!title) continue;
+    const href = `/docs/${[...parentSegs, slug].join("/")}`;
+    const desc = descByToken.get(child.node_token);
+    const descAttr = desc ? ` description="${escapeMdxAttr(desc)}"` : "";
+    cards.push(`  <Card title="${title}" href="${href}"${descAttr} />`);
+  }
+  if (cards.length === 0) return "";
+  return ["## 本节内容", "", "<Cards>", ...cards, "</Cards>"].join("\n");
+}
+
 function deriveDescription(body: string): string {
   const lines = body.split("\n");
   const paragraphs: string[] = [];
@@ -842,6 +894,28 @@ function parseFeishuFrontmatter(
     editTime: editMatch ? Number(editMatch[1]) : null,
     legacyIso: isoMatch ? isoMatch[1] : null,
   };
+}
+
+/**
+ * Pull a single string-valued field out of a raw frontmatter block. Handles
+ * single-quoted, double-quoted, or bare scalar values. Returns null if the
+ * field is absent. Single-quoted YAML doubles `''` → `'`; we undo that.
+ */
+function extractFrontmatterField(fm: string, name: string): string | null {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const single = fm.match(
+    new RegExp(`^\\s*${escapedName}:\\s*'((?:[^']|'')*)'\\s*$`, "m"),
+  );
+  if (single) return single[1].replace(/''/g, "'");
+  const double = fm.match(
+    new RegExp(`^\\s*${escapedName}:\\s*"((?:[^"\\\\]|\\\\.)*)"\\s*$`, "m"),
+  );
+  if (double) return double[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  const bare = fm.match(
+    new RegExp(`^\\s*${escapedName}:\\s*([^\\n'"][^\\n]*?)\\s*$`, "m"),
+  );
+  if (bare) return bare[1];
+  return null;
 }
 
 /**
@@ -1091,6 +1165,14 @@ async function main() {
 
     const existing = existingByToken.get(node.obj_token);
     const decision = shouldSyncDocx(node, existing, opts);
+    // Containers always re-render so their auto-generated <Cards> block
+    // tracks the current child list — adding or removing a sibling page
+    // doesn't change the container's own obj_edit_time, so without this
+    // override the cards would silently go stale.
+    if (node.has_child && !decision.sync) {
+      decision.sync = true;
+      decision.reason = "container-cards-refresh";
+    }
 
     let rawMd = "";
     let rawXml = "";
@@ -1157,7 +1239,43 @@ async function main() {
       : [...parents, `${slug}.mdx`].join("/");
   }
 
-  // Phase 3: write files and track what we touched
+  // Phase 3a: render bodies for every entry that needs syncing, and collect
+  // descriptions for ALL pending entries (synced + up-to-date). The latter
+  // feeds the auto-generated <Cards> block on container index pages — each
+  // child's description is sourced from this map rather than re-fetched.
+  interface RenderedBody {
+    body: string;
+    media: string[];
+  }
+  const renderedByToken = new Map<string, RenderedBody>();
+  const descByToken = new Map<string, string>();
+
+  for (const p of pending) {
+    if (!p.targetRel) continue;
+    if (p.decision.sync) {
+      const result = transformDocxMarkdown(p.rawMd, p.rawXml, p.node.title);
+      renderedByToken.set(p.node.node_token, {
+        body: result.body,
+        media: result.mediaTokens,
+      });
+      const desc = deriveDescription(result.body);
+      if (desc) descByToken.set(p.node.node_token, desc);
+    } else {
+      const existing = existingByToken.get(p.node.obj_token);
+      if (existing) {
+        const fm = readFrontmatterRaw(join(CONTENT_DIR, existing.path));
+        const desc = fm ? extractFrontmatterField(fm, "description") : null;
+        if (desc) descByToken.set(p.node.node_token, desc);
+      }
+    }
+  }
+
+  // Placeholder fallback that older sync runs wrote into container indexes
+  // — strip it before appending fresh cards so we don't render both.
+  const CONTAINER_PLACEHOLDER_RE =
+    /^本节包含若干篇分享内容[，,]\s*请从左侧目录进入[。.]?\s*$/m;
+
+  // Phase 3b: write files and track what we touched
   const writtenPaths = new Set<string>();
   let synced = 0;
   let skippedUpToDate = 0;
@@ -1204,26 +1322,56 @@ async function main() {
       `[sync] ${p.targetRel.padEnd(48)} ← ${p.node.obj_token} (${p.decision.reason})`,
     );
 
-    const result = transformDocxMarkdown(p.rawMd, p.rawXml, p.node.title);
-    let body = result.body;
-    const media = result.mediaTokens;
+    const rendered = renderedByToken.get(p.node.node_token);
+    let humanBody = (rendered?.body ?? "").trim();
+    const media = rendered?.media ?? [];
 
-    if (!body.trim()) {
+    // Drop the auto-placeholder so it doesn't sit alongside the fresh cards.
+    humanBody = humanBody.replace(CONTAINER_PLACEHOLDER_RE, "").trim();
+
+    let cardsBlock = "";
+    if (p.node.has_child) {
+      const childrenWiki = childrenOf.get(p.node.node_token) ?? [];
+      cardsBlock = buildContainerCardsBlock(
+        childrenWiki,
+        tokenToSlug,
+        descByToken,
+        p.targetRel,
+      );
+    }
+
+    if (!humanBody && !cardsBlock) {
       if (p.node.has_child) {
-        body = "本节包含若干篇分享内容，请从左侧目录进入。\n";
+        humanBody = "本节包含若干篇分享内容，请从左侧目录进入。";
       } else {
         const url = `${WIKI_URL_PREFIX}${p.node.node_token}`;
-        body = `> 此页面暂未填充内容。原始飞书文档：[${p.node.title.trim()}](${url})\n`;
+        humanBody = `> 此页面暂未填充内容。原始飞书文档：[${p.node.title.trim()}](${url})`;
       }
+    }
+
+    let body: string;
+    if (cardsBlock) {
+      const importLine =
+        "import { Card, Cards } from 'fumadocs-ui/components/card';";
+      body = humanBody
+        ? `${importLine}\n\n${humanBody}\n\n${cardsBlock}\n`
+        : `${importLine}\n\n${cardsBlock}\n`;
+    } else {
+      body = `${humanBody}\n`;
     }
 
     if (!opts.dryRun) {
       for (const tok of media) downloadMedia(tok, opts);
     }
 
+    // Description: derive from the human-written body when present so the
+    // SEO/OG snippet reflects what the author wrote, not the auto-cards.
+    // For pure-cards container indexes, fall back to the placeholder hint.
+    const descSource =
+      humanBody || "本节包含若干篇分享内容，请从左侧目录进入。";
     const fm = frontmatter({
       title: p.node.title.trim(),
-      description: deriveDescription(body),
+      description: deriveDescription(descSource),
       feishuToken: p.node.obj_token,
       feishuEditTime: p.node.obj_edit_time,
       lastSyncedAt: stamp,
