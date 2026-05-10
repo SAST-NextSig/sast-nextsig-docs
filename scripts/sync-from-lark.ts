@@ -1574,7 +1574,7 @@ function syncShareArchive(stamp: string) {
     const outPath = join(DATA_DIR, "share-records.json");
     writeFileSync(
       outPath,
-      JSON.stringify({ updatedAt: stamp, records }, null, 2),
+      `${JSON.stringify({ updatedAt: stamp, records }, null, 2)}\n`,
       "utf8",
     );
     console.log(
