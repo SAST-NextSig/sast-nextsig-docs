@@ -15,13 +15,11 @@ export default function HomePage() {
             <SparklesIcon className="size-3.5" />
             南京邮电大学 · SAST · Next Sig
           </span>
-          <h1 className="bg-linear-to-br from-fd-foreground to-fd-foreground/60 bg-clip-text text-5xl font-bold tracking-tight text-transparent md:text-6xl">
+          <h1 className="bg-linear-to-br from-fd-foreground to-fd-foreground/60 bg-clip-text text-5xl font-bold leading-[1.05] tracking-tight text-transparent pb-1 md:text-6xl md:pb-2">
             SAST Next Sig
           </h1>
           <p className="mt-4 max-w-2xl text-balance text-base text-fd-muted-foreground md:text-lg">
-            一片相对干净的土壤 ——
-            分享会形式的开放讨论，覆盖前沿技术与计算机底层。 内容来自飞书 Wiki
-            的实时同步，开源在 GitHub。
+            一片相对干净的土壤
           </p>
           <div className="mt-8 flex flex-col items-center gap-3 sm:flex-row">
             <Link
@@ -46,14 +44,14 @@ export default function HomePage() {
       <section className="mx-auto grid w-full max-w-5xl grid-cols-1 gap-4 px-4 py-12 md:grid-cols-3">
         <FeatureCard
           title="主题随心"
-          description="计算机、AI、网络、协议、操作系统 —— 分享者自由选题，深度优先。"
+          description="自由选材, 深度优先, 计算机 & AI 方向"
         />
         <FeatureCard
           title="飞书同步"
-          description="原始内容写在飞书 Wiki，本站通过脚本自动转 MDX，结构化呈现。"
+          description="原始内容写在飞书 Wiki,本站通过脚本自动转 MDX,结构化呈现。"
         />
         <FeatureCard
-          title="可搜索 / 可问 AI"
+          title="全文索引"
           description="全站内容已建立全文索引；浮动按钮 Ask AI 直接基于文档回答问题。"
         />
       </section>
