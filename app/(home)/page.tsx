@@ -8,14 +8,14 @@ export default function HomePage() {
       <section className="relative overflow-hidden border-b border-fd-border">
         <div
           aria-hidden
-          className="absolute inset-0 -z-10 bg-[radial-gradient(circle_at_top,theme(colors.fd-primary/0.18),transparent_60%)]"
+          className="absolute inset-0 -z-10 bg-[radial-gradient(circle_at_top,var(--color-fd-primary),transparent_60%)]/18"
         />
         <div className="mx-auto flex max-w-5xl flex-col items-center px-4 py-20 text-center md:py-28">
           <span className="mb-6 inline-flex items-center gap-2 rounded-full border border-fd-border bg-fd-card px-3 py-1 text-xs font-medium text-fd-muted-foreground">
             <SparklesIcon className="size-3.5" />
             南京邮电大学 · SAST · Next Sig
           </span>
-          <h1 className="bg-gradient-to-br from-fd-foreground to-fd-foreground/60 bg-clip-text text-5xl font-bold tracking-tight text-transparent md:text-6xl">
+          <h1 className="bg-linear-to-br from-fd-foreground to-fd-foreground/60 bg-clip-text text-5xl font-bold tracking-tight text-transparent md:text-6xl">
             SAST Next Sig
           </h1>
           <p className="mt-4 max-w-2xl text-balance text-base text-fd-muted-foreground md:text-lg">
@@ -33,7 +33,7 @@ export default function HomePage() {
               <ArrowRightIcon className="size-4" />
             </Link>
             <Link
-              href="/docs/getting-started"
+              href="/docs/sast-next-sig-服用指南"
               className="inline-flex h-11 items-center gap-2 rounded-lg border border-fd-border bg-fd-card px-5 text-sm font-medium text-fd-foreground transition hover:bg-fd-muted"
             >
               服用指南
