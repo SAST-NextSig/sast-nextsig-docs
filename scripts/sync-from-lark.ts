@@ -1,17 +1,50 @@
 /**
  * Sync the SAST Next Sig wiki space from Feishu/Lark into content/docs/.
  *
- * Run: pnpm sync:lark            (full sync, cleans content/docs first)
- *      pnpm sync:lark --dry-run  (no writes)
- *      pnpm sync:lark --no-clean (preserve existing files)
+ * Run modes:
+ *   pnpm sync:lark              incremental — pull only nodes whose
+ *                               obj_edit_time is newer than the local copy.
+ *                               Missing media is downloaded; existing media
+ *                               is left untouched.
+ *   pnpm sync:lark --force      re-pull every node and re-download every
+ *                               image regardless of cached state.
+ *   pnpm sync:lark --clean      delete every script-managed file (anything
+ *                               with `feishuToken` in its frontmatter), wipe
+ *                               public/lark-media, then full pull. Hand-
+ *                               written files (no `feishuToken`) are kept.
+ *                               Implies --force.
+ *   pnpm sync:lark --dry-run    log what would happen, no writes.
  *
- * Requires: lark-cli on PATH, authenticated as a user that can read the wiki space.
+ * Everything is dynamic:
+ *   - Slug = slugify(node.title). CJK is preserved verbatim — modern URL
+ *     stacks handle non-ASCII fine. Override per-doc by adding a single
+ *     line to the docx body in Lark:  `slug: my-custom-slug`
+ *   - Folder structure = wiki parent-chain. A container's children live in
+ *     `<container-slug>/` and its own docx body is written as
+ *     `<container-slug>/index.mdx`.
+ *   - Per-folder `meta.json` is auto-generated when missing (page order
+ *     follows Lark's wiki order). Existing `meta.json` files are never
+ *     overwritten — hand-edit them to lock in a custom order.
+ *   - Hand-written vs script-managed is decided by frontmatter, not a
+ *     hard-coded list: a file is owned by the script iff it has a
+ *     `feishuToken:` field. Anything without one is left alone.
+ *   - Embedded `<bitable token="..." />` blocks in a docx are replaced with
+ *     a real markdown table fetched from the bitable's first table.
+ *
+ * Special-cased nodes:
+ *   - BITABLE_ARCHIVE_TOKEN still drives lib/data/share-records.json via
+ *     syncShareArchive(); the page itself (app/.../archive.mdx) consumes
+ *     the JSON through the <ShareArchive /> component.
+ *
+ * Requires: lark-cli on PATH, authenticated as a user that can read the wiki.
  */
 import { execSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -24,36 +57,27 @@ const MEDIA_DIR = join(ROOT, "public", "lark-media");
 const DATA_DIR = join(ROOT, "lib", "data");
 const WIKI_URL_PREFIX = "https://njupt-sast.feishu.cn/wiki/";
 
-// Wiki nodes whose `parent_node_token` is empty but which `wiki nodes list` does
-// not return — we list them as additional seeds and pull via wiki spaces get_node.
+// Wiki nodes whose `parent_node_token` is empty but which `wiki nodes list`
+// does not return — listed as additional discovery seeds and pulled via
+// `wiki spaces get_node`.
 const EXTRA_SEEDS = ["KatOwPcwTiGfRxk5LBRc9RJtnDe"];
 
-// node_token → relative slug under content/docs (no leading slash, no .mdx).
-// Empty-container nodes (index, first-meeting/index, second-meeting) and the
-// archive page (rendered from JSON via <ShareArchive />) are not listed here;
-// the clean step preserves them via HANDWRITTEN_FILES below.
-const PATH_MAP: Record<string, string> = {
-  VxqLwYkTZiFiBskJPAncgRtHnjf: "getting-started", // SAST Next Sig 服用指南
-  WKbnw04HYirT2kkm6KTcvZltnm6: "first-meeting/why-proxy-traffic-gets-detected",
-  LziGwjFEIigqNcklL4VcdeRPngb: "first-meeting/context-engineering",
-  N9lswyBw9iuB7PkiDSOcneznnqe: "first-meeting/claude-code-getting-started",
-  UFPmwhdrOiFw9TkP3TicoCIqnVf: "first-meeting/cloudflare-tunnel-deployment",
-};
+// Tokens to skip entirely. Children of an ignored token are also skipped
+// silently. Keep this minimal — only for nodes that genuinely shouldn't
+// produce a page (root-anchor docs, archived sections, etc.).
+const IGNORED_TOKENS = new Set<string>([
+  // "SAST Next Sig" — root anchor, duplicates the hand-written index.mdx.
+  "KatOwPcwTiGfRxk5LBRc9RJtnDe",
+]);
 
-// node_token of the bitable that drives the share-archive page.
+// node_token of the bitable backing the <ShareArchive /> component on the
+// hand-written archive page. Synced separately into
+// lib/data/share-records.json — does not produce an MDX file.
 const BITABLE_ARCHIVE_TOKEN = "UYPIbjgltah32Msm56QcWSz8npg";
 
-// Files we hand-write and don't want overwritten by sync. Paths are relative
-// to CONTENT_DIR. The clean step below preserves these explicitly.
-const HANDWRITTEN_FILES = new Set([
-  "index.mdx",
-  "second-meeting.mdx",
-  "components.mdx",
-  "archive.mdx",
-  "first-meeting/index.mdx",
-  "meta.json",
-  "first-meeting/meta.json",
-]);
+// --------------------------------------------------------------------------
+// Types
+// --------------------------------------------------------------------------
 
 interface Node {
   node_token: string;
@@ -62,18 +86,58 @@ interface Node {
   title: string;
   parent_node_token: string;
   has_child: boolean;
+  /** Unix seconds, as a numeric string. */
+  obj_edit_time: string;
 }
 
+interface SyncOptions {
+  force: boolean;
+  clean: boolean;
+  dryRun: boolean;
+}
+
+interface TransformResult {
+  body: string;
+  mediaTokens: string[];
+}
+
+interface ExistingFile {
+  /** path relative to CONTENT_DIR, posix slashes */
+  path: string;
+  feishuToken: string;
+  feishuEditTime: number | null;
+  legacyIso: string | null;
+}
+
+// --------------------------------------------------------------------------
+// lark-cli wrappers
+// --------------------------------------------------------------------------
+
 function lark(args: string[], timeoutMs = 90_000): string {
-  // shell:true so Windows resolves the lark-cli.cmd shim on PATH.
-  // We single-quote each arg to keep JSON --params intact regardless of shell.
   const quoted = args.map((a) => `"${a.replace(/"/g, '\\"')}"`).join(" ");
-  return execSync(`lark-cli ${quoted}`, {
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-    timeout: timeoutMs,
-    windowsHide: true,
-  });
+  // stdio: ["pipe", "pipe", "pipe"] silences lark-cli's stderr chatter
+  // (skill-registration probes, "[page N] fetching…" pagination notices,
+  // etc.) — the sync script does its own progress logging. On non-zero
+  // exit Node still surfaces the error and we re-throw with the captured
+  // stderr appended for diagnostics.
+  try {
+    return execSync(`lark-cli ${quoted}`, {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: timeoutMs,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (e) {
+    const err = e as { stderr?: Buffer | string; message: string };
+    const stderr =
+      typeof err.stderr === "string"
+        ? err.stderr
+        : err.stderr?.toString("utf8") ?? "";
+    throw new Error(
+      stderr.trim() ? `${err.message}\n${stderr.trim()}` : err.message,
+    );
+  }
 }
 
 function larkJson(args: string[], timeoutMs = 90_000): unknown {
@@ -135,11 +199,21 @@ function getNode(token: string): Node | null {
   }
 }
 
-function flattenTree(): Node[] {
+interface TreeListing {
+  /** All nodes flat */
+  nodes: Node[];
+  /** Direct children of a given parent_node_token (preserves wiki order) */
+  childrenOf: Map<string, Node[]>;
+}
+
+function flattenTree(): TreeListing {
   const seen = new Set<string>();
   const result: Node[] = [];
+  const childrenOf = new Map<string, Node[]>();
   const visit = (parent: string) => {
-    for (const item of listChildren(parent)) {
+    const items = listChildren(parent);
+    childrenOf.set(parent, items);
+    for (const item of items) {
       if (seen.has(item.node_token)) continue;
       seen.add(item.node_token);
       result.push(item);
@@ -155,12 +229,245 @@ function flattenTree(): Node[] {
       result.push(node);
     }
   }
-  return result;
+  return { nodes: result, childrenOf };
 }
 
-interface TransformResult {
-  body: string;
-  mediaTokens: string[];
+// --------------------------------------------------------------------------
+// Slug derivation — fully dynamic (no per-doc config)
+// --------------------------------------------------------------------------
+
+/**
+ * Build a URL-safe slug. Keeps Latin alphanumerics and CJK characters; turns
+ * common separators (spaces, `/` `:` `：` `|` `_` etc.) into single dashes.
+ * Lower-cases ASCII so URLs are stable regardless of how the title was cased
+ * in Lark. CJK is preserved verbatim — modern URL stacks handle non-ASCII.
+ */
+function slugify(title: string): string {
+  return title
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_:：|/\\—–·•、，,。.]+/g, "-")
+    .replace(/[^\p{L}\p{N}-]/gu, "")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * Allow per-doc slug override without touching the script: any line of the
+ * form `slug: my-custom-slug` near the top of the docx body wins. Looked up
+ * across the first ~2KB so it can sit alongside the user's pseudo-frontmatter
+ * blockquote (`> title: …`, `> tags: …`) or as a free-standing line.
+ */
+function extractSlugFromBody(rawMd: string): string | null {
+  const head = rawMd.slice(0, 2048);
+  const m = head.match(/(?:^|\n)\s*(?:>\s*)?slug:\s*([A-Za-z0-9_\-./]+)\s*(?:\n|$)/);
+  return m ? m[1].trim().replace(/^\/+|\/+$/g, "") : null;
+}
+
+function autoSlug(
+  node: Node,
+  rawMd: string | undefined,
+  bitableSlugByToken: Map<string, string>,
+): string | null {
+  // Priority 1 — explicit `slug:` line in the docx body (user override).
+  if (rawMd) {
+    const fromBody = extractSlugFromBody(rawMd);
+    if (fromBody) return fromBody;
+  }
+  // Priority 2 — slug derived from the share-archive bitable's
+  // `分享标题 / 内容` column (matched by Lark URL token in `分享文档`).
+  const fromBitable =
+    bitableSlugByToken.get(node.obj_token) ??
+    bitableSlugByToken.get(node.node_token);
+  if (fromBitable) return fromBitable;
+  // Priority 3 — slugify the wiki node's own title (CJK preserved).
+  const auto = slugify(node.title);
+  return auto || null;
+}
+
+/**
+ * Build a `token → slugified-share-title` map by reading the share-archive
+ * bitable. Each record's `分享文档` cell is parsed for a Lark URL; the token
+ * (whether `wiki/<node_token>` or `docx/<obj_token>`) is keyed against the
+ * record's `分享标题 / 内容` column. Records without a Lark URL (external
+ * blogs etc.) and records whose title produces an empty slug are skipped.
+ *
+ * Network failure is non-fatal — returns an empty map so the sync falls
+ * through to title-based slugs.
+ */
+function loadBitableSlugMap(): Map<string, string> {
+  const map = new Map<string, string>();
+  let records: ShareRecord[];
+  try {
+    records = fetchBitableRecords(BITABLE_ARCHIVE_TOKEN);
+  } catch (e) {
+    console.error(
+      `[sync] bitable slug-map 拉取失败: ${(e as Error).message.split("\n")[0]} (使用标题作为兜底)`,
+    );
+    return map;
+  }
+  const seenSlugs = new Set<string>();
+  for (const r of records) {
+    if (!r.link?.url) continue;
+    const tokens = extractLarkTokens(r.link.url);
+    if (tokens.length === 0) continue;
+    const slug = slugify(r.title);
+    if (!slug) continue;
+    if (seenSlugs.has(slug)) {
+      // Two records would slugify to the same path — fall back to title-
+      // based slug for both rather than silently overwriting one.
+      console.log(
+        `[sync] ⚠ bitable 标题重复: '${r.title}' → 跳过 slug 映射,改用 wiki 标题`,
+      );
+      for (const t of tokens) map.delete(t);
+      continue;
+    }
+    seenSlugs.add(slug);
+    for (const t of tokens) map.set(t, slug);
+  }
+  return map;
+}
+
+/**
+ * Pull every Lark token (node_token or obj_token) out of a URL string.
+ * Handles both `feishu.cn/wiki/<token>` and `feishu.cn/docx/<token>` forms,
+ * with or without query parameters.
+ */
+function extractLarkTokens(url: string): string[] {
+  const out: string[] = [];
+  for (const m of url.matchAll(/\bfeishu\.cn\/(?:wiki|docx)\/([A-Za-z0-9]+)/g)) {
+    out.push(m[1]);
+  }
+  return out;
+}
+
+function hasIgnoredAncestor(
+  node: Node,
+  byToken: Map<string, Node>,
+): boolean {
+  let cur = byToken.get(node.parent_node_token);
+  while (cur) {
+    if (IGNORED_TOKENS.has(cur.node_token)) return true;
+    cur = byToken.get(cur.parent_node_token);
+  }
+  return false;
+}
+
+/**
+ * Build the ancestor folder chain for a node. For each ancestor we use its
+ * docx body (if available) so a `slug:` override there changes the folder
+ * name. Falls back to slugify(title). Returns null if any ancestor is
+ * unmappable or ignored.
+ */
+function ancestorFolders(
+  node: Node,
+  byToken: Map<string, Node>,
+  ancestorSlug: (n: Node) => string | null,
+): string[] | null {
+  const segments: string[] = [];
+  let cur = byToken.get(node.parent_node_token);
+  while (cur) {
+    if (IGNORED_TOKENS.has(cur.node_token)) return null;
+    const s = ancestorSlug(cur);
+    if (!s) return null;
+    segments.unshift(s);
+    cur = byToken.get(cur.parent_node_token);
+  }
+  return segments;
+}
+
+// --------------------------------------------------------------------------
+// docx markdown transform
+// --------------------------------------------------------------------------
+
+/**
+ * Render an embedded `<bitable token="…" />` block as an inline markdown
+ * table by listing the bitable's first table. Errors degrade to a hint
+ * blockquote so a single broken embed doesn't block the whole sync.
+ */
+function renderBitableEmbed(token: string): string {
+  try {
+    const tablesResp = larkJson([
+      "base",
+      "+table-list",
+      "--base-token",
+      token,
+    ]) as { data?: { tables?: { id: string; name?: string }[] } };
+    const tableId = tablesResp?.data?.tables?.[0]?.id;
+    if (!tableId) {
+      return `\n> 飞书多维表格 (token=${token}) 没有可读的表\n`;
+    }
+    const raw = lark([
+      "base",
+      "+record-list",
+      "--base-token",
+      token,
+      "--table-id",
+      tableId,
+      "--limit",
+      "200",
+      "--format",
+      "markdown",
+    ]);
+    const cleaned = sanitizeBitableMarkdown(raw);
+    if (!cleaned) {
+      return `\n> 飞书多维表格 (token=${token}) 表内无数据\n`;
+    }
+    return `\n${cleaned}\n`;
+  } catch (e) {
+    const msg = (e as Error).message.split("\n")[0];
+    return `\n> 飞书多维表格 (token=${token}) 拉取失败: ${msg}\n`;
+  }
+}
+
+function sanitizeBitableMarkdown(rawTable: string): string {
+  const lines = rawTable.split("\n");
+  const out: string[] = [];
+  for (const line of lines) {
+    if (line.startsWith("`_record_id`")) continue;
+    if (line.startsWith("Meta:")) continue;
+    if (!line.startsWith("|")) {
+      // skip non-table prose; keep things tight
+      continue;
+    }
+    // Drop the record-id column on a pipe-aware split so embedded `\|`
+    // inside cell content (e.g. markdown link text) doesn't get truncated.
+    const cells = splitMarkdownTableRow(line);
+    const trimmed = [cells[0], ...cells.slice(2)]; // drop column 1 (record id)
+    let rebuilt = trimmed.join("|");
+    // Strip Lark person mentions of the form "Alias [@真实姓名](avatar-url)"
+    // — keep only the alias to avoid leaking real names + avatar URLs.
+    rebuilt = rebuilt.replace(/\s*\[@[^\]]+\]\(https?:\/\/[^)]+\)/g, "");
+    out.push(rebuilt);
+  }
+  return out.join("\n").trim();
+}
+
+/**
+ * Split a markdown-table row on UNESCAPED `|` only — pipes inside cell
+ * content escape themselves as `\|`, and a naive split shreds them. The
+ * leading and trailing empty strings (from `|...|` borders) are kept so
+ * callers can preserve column count via slicing.
+ */
+function splitMarkdownTableRow(line: string): string[] {
+  const cells: string[] = [];
+  let buf = "";
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === "\\" && line[i + 1] === "|") {
+      buf += "|"; // unescape
+      i++;
+      continue;
+    }
+    if (c === "|") {
+      cells.push(buf);
+      buf = "";
+      continue;
+    }
+    buf += c;
+  }
+  cells.push(buf);
+  return cells;
 }
 
 function transformDocxMarkdown(
@@ -174,11 +481,13 @@ function transformDocxMarkdown(
   md = md.replace(/<title>[\s\S]*?<\/title>/gi, "");
 
   // 1b. Drop the document H1 — Fumadocs renders the title from frontmatter.
-  //     We delete only the first H1 whose text fuzzy-matches the node title,
-  //     and any leading H1 occurring before substantive content.
   const escapedTitle = nodeTitle.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   md = md.replace(new RegExp(`^#\\s+${escapedTitle}\\s*\\n+`, "m"), "");
   md = md.replace(/^#\s+[^\n]+\n+/, "");
+
+  // 1c. If the user added `slug: foo` near the top, strip it from the body
+  //     (we already consumed it for the URL; no need to render it).
+  md = md.replace(/(?:^|\n)\s*(?:>\s*)?slug:\s*[A-Za-z0-9_\-./]+\s*(?=\n|$)/, "");
 
   // 2. Map image tokens by parsing xml. Order is preserved.
   const xmlImgTokens: string[] = [];
@@ -236,14 +545,34 @@ function transformDocxMarkdown(
   md = md.replace(/<folder_manager\s*>\s*<\/folder_manager>/g, "");
   md = md.replace(/<folder_manager\s*\/>/g, "");
 
-  // 6. Embedded sheet/bitable/whiteboard/etc. — replace with hint blockquote.
+  // 6. Embedded bitable — render the first table as an inline markdown
+  //     table. Other embeds (sheet/whiteboard/mindnote/slides/file) stay as
+  //     a hint blockquote pointing at the original.
   md = md.replace(
-    /<(sheet|bitable|whiteboard|mindnote|slides|file)\b[^>]*\/>/g,
-    "\n> 飞书表格 / 文件嵌入块未在静态站点渲染，请[查看飞书原文](#)。\n",
+    /<bitable\b([^>]*?)\/>/g,
+    (_match, attrs: string) => {
+      const token = extractAttr(attrs, "token");
+      if (!token) return "\n> 飞书多维表格嵌入块缺少 token\n";
+      return renderBitableEmbed(token);
+    },
   );
   md = md.replace(
-    /<(sheet|bitable|whiteboard|mindnote|slides|file)\b[^>]*>[\s\S]*?<\/\1>/g,
-    "\n> 飞书表格 / 文件嵌入块未在静态站点渲染，请[查看飞书原文](#)。\n",
+    /<bitable\b([^>]*?)>[\s\S]*?<\/bitable>/g,
+    (_match, attrs: string) => {
+      const token = extractAttr(attrs, "token");
+      if (!token) return "\n> 飞书多维表格嵌入块缺少 token\n";
+      return renderBitableEmbed(token);
+    },
+  );
+  md = md.replace(
+    /<(sheet|whiteboard|mindnote|slides|file)\b[^>]*\/>/g,
+    (_match, kind: string) =>
+      `\n> 飞书 ${kind} 嵌入块未在静态站点渲染，请[查看飞书原文](#)。\n`,
+  );
+  md = md.replace(
+    /<(sheet|whiteboard|mindnote|slides|file)\b[^>]*>[\s\S]*?<\/\1>/g,
+    (_match, kind: string) =>
+      `\n> 飞书 ${kind} 嵌入块未在静态站点渲染，请[查看飞书原文](#)。\n`,
   );
 
   // 7. ::: note / ::: warning / ::: tip → <Callout>.
@@ -274,7 +603,7 @@ function transformDocxMarkdown(
     /(^|\n)---\s*\n([\s\S]*?)\n---\s*(\n|$)/g,
     (full, lead: string, inner: string, trail: string) => {
       if (
-        /^\s*(title|published|tags|date|category|categories|author|description)\s*:/m.test(
+        /^\s*(title|published|tags|date|category|categories|author|description|slug)\s*:/m.test(
           inner,
         )
       ) {
@@ -282,6 +611,7 @@ function transformDocxMarkdown(
           .split("\n")
           .map((l) => l.trim())
           .filter(Boolean)
+          .filter((l) => !/^slug\s*:/i.test(l)) // already extracted
           .map((l) => `> ${l}`);
         return `${lead}\n${lines.join("\n")}\n${trail}`;
       }
@@ -294,8 +624,6 @@ function transformDocxMarkdown(
 
   // 11. Lower-case fenced code-block languages (Shiki tokens are
   //     case-sensitive: `Bash`/`TypeScript`/`Dockerfile` won't load).
-  //     Allow blockquote markers `> ` before the fence so quoted code blocks
-  //     are normalised too.
   md = md.replace(
     /^([>\s]*)```([A-Za-z][\w+-]*)([^\n]*)$/gm,
     (_full, prefix: string, lang: string, rest: string) =>
@@ -315,6 +643,15 @@ function transformDocxMarkdown(
 
   return { body: `${md.trim()}\n`, mediaTokens: xmlImgTokens };
 }
+
+function extractAttr(attrs: string, name: string): string | null {
+  const m = attrs.match(new RegExp(`\\b${name}\\s*=\\s*"([^"]+)"`));
+  return m ? m[1] : null;
+}
+
+// --------------------------------------------------------------------------
+// bitable share-archive (drives <ShareArchive />)
+// --------------------------------------------------------------------------
 
 interface ShareRecord {
   speaker: string;
@@ -354,13 +691,14 @@ function parseShareRecordsMd(rawTable: string): ShareRecord[] {
   for (const line of lines) {
     if (!line.startsWith("|")) continue;
     if (line.startsWith("`_record_id`") || line.startsWith("Meta:")) continue;
-    // Drop leading record-id column.
-    const stripped = line.replace(/^\|[^|]*\|/, "|");
-    const cells = stripped
-      .split("|")
-      .slice(1, -1)
+    // Drop leading record-id column. Be careful: cell content may contain
+    // escaped pipes (`\|`) inside markdown link text — split on UNESCAPED
+    // pipes only, then unescape each cell.
+    const cells = splitMarkdownTableRow(line)
+      .slice(1, -1) // drop the empty edges from leading/trailing `|`
+      .slice(1)     // drop the record-id column
       .map((c) => c.trim());
-    if (cells.every((c) => /^-+$/.test(c))) continue; // separator row
+    if (cells.every((c) => /^-+$/.test(c))) continue;
     if (!header) {
       header = cells;
       continue;
@@ -383,7 +721,6 @@ function parseShareRecordsMd(rawTable: string): ShareRecord[] {
     let link: ShareRecord["link"] | undefined;
     if (linkMatch) {
       const [, text, url] = linkMatch;
-      // Some cells render as [https://...](https://...) — collapse to just URL.
       const cleanText = text === url ? prettifyUrl(url) : text;
       link = { text: cleanText, url };
     }
@@ -402,25 +739,9 @@ function prettifyUrl(url: string): string {
   }
 }
 
-function _transformBitableMarkdown(rawTable: string): string {
-  const lines = rawTable.split("\n");
-  const out: string[] = [];
-  for (const line of lines) {
-    if (line.startsWith("`_record_id`")) continue;
-    if (line.startsWith("Meta:")) continue;
-    if (!line.startsWith("|")) {
-      out.push(line);
-      continue;
-    }
-    // Drop the first column (record id / metadata).
-    let stripped = line.replace(/^\|[^|]*\|/, "|");
-    // Strip Lark person mentions of the form "Alias [@真实姓名](avatar-url)"
-    // — keep only the alias to avoid leaking real names + avatar URLs.
-    stripped = stripped.replace(/\s*\[@[^\]]+\]\(https?:\/\/[^)]+\)/g, "");
-    out.push(stripped);
-  }
-  return out.join("\n").trim();
-}
+// --------------------------------------------------------------------------
+// frontmatter & description helpers
+// --------------------------------------------------------------------------
 
 function escapeYaml(value: string | number | undefined): string | undefined {
   if (value === undefined || value === null) return undefined;
@@ -445,9 +766,6 @@ function frontmatter(
 }
 
 function deriveDescription(body: string): string {
-  // Build paragraphs from body, skipping headings, blockquotes, code fences,
-  // tables, and JSX/HTML-only lines. Pick the first paragraph longer than 20
-  // characters as a representative description.
   const lines = body.split("\n");
   const paragraphs: string[] = [];
   let current: string[] = [];
@@ -498,11 +816,112 @@ function deriveDescription(body: string): string {
     .slice(0, 160);
 }
 
-function downloadMedia(token: string): boolean {
+/**
+ * Read a file's frontmatter as raw YAML text. Returns null if the file does
+ * not exist or has no frontmatter block.
+ */
+function readFrontmatterRaw(filePath: string): string | null {
+  if (!existsSync(filePath)) return null;
+  const text = readFileSync(filePath, "utf8");
+  if (!text.startsWith("---")) return null;
+  const end = text.indexOf("\n---", 3);
+  if (end < 0) return null;
+  return text.slice(3, end);
+}
+
+function parseFeishuFrontmatter(
+  fm: string,
+): { token: string; editTime: number | null; legacyIso: string | null } | null {
+  const tokenMatch = fm.match(/^\s*feishuToken:\s*['"]?([^'"\n]+?)['"]?\s*$/m);
+  if (!tokenMatch) return null;
+  const editMatch = fm.match(/^\s*feishuEditTime:\s*['"]?(\d+)['"]?\s*$/m);
+  const isoMatch = fm.match(/^\s*lastSyncedAt:\s*['"]?([^'"\n]+?)['"]?\s*$/m);
+  return {
+    token: tokenMatch[1],
+    editTime: editMatch ? Number(editMatch[1]) : null,
+    legacyIso: isoMatch ? isoMatch[1] : null,
+  };
+}
+
+/**
+ * Walk CONTENT_DIR, returning every `.mdx` file whose frontmatter has a
+ * `feishuToken`. These are the files the script owns; anything else is
+ * treated as hand-written and left alone.
+ */
+function scanExistingSyncedFiles(): ExistingFile[] {
+  const out: ExistingFile[] = [];
+  if (!existsSync(CONTENT_DIR)) return out;
+  const stack: string[] = [CONTENT_DIR];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    if (dir === undefined) break;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      if (!entry.name.endsWith(".mdx")) continue;
+      const fm = readFrontmatterRaw(full);
+      if (!fm) continue;
+      const parsed = parseFeishuFrontmatter(fm);
+      if (!parsed) continue;
+      // The archive bitable token shows up on a hand-written page that
+      // consumes lib/data/share-records.json via <ShareArchive />. The
+      // sync owns the JSON, not the page, so don't track it as a managed
+      // file (otherwise it'd get flagged as orphan or wiped by --clean).
+      if (parsed.token === BITABLE_ARCHIVE_TOKEN) continue;
+      out.push({
+        path: relative(CONTENT_DIR, full).replace(/\\/g, "/"),
+        feishuToken: parsed.token,
+        feishuEditTime: parsed.editTime,
+        legacyIso: parsed.legacyIso,
+      });
+    }
+  }
+  return out;
+}
+
+function shouldSyncDocx(
+  node: Node,
+  existing: ExistingFile | undefined,
+  opts: SyncOptions,
+): { sync: boolean; reason: string } {
+  if (opts.force) return { sync: true, reason: "force" };
+  if (!existing) return { sync: true, reason: "missing" };
+  const remoteEdit = Number(node.obj_edit_time);
+  if (!Number.isFinite(remoteEdit) || remoteEdit <= 0) {
+    return { sync: true, reason: "no-remote-edit-time" };
+  }
+  if (existing.feishuEditTime != null) {
+    if (remoteEdit > existing.feishuEditTime) {
+      return { sync: true, reason: "newer" };
+    }
+    return { sync: false, reason: "up-to-date" };
+  }
+  if (existing.legacyIso) {
+    const existingSec = Math.floor(
+      new Date(existing.legacyIso).getTime() / 1000,
+    );
+    if (Number.isFinite(existingSec) && remoteEdit > existingSec) {
+      return { sync: true, reason: "newer-legacy" };
+    }
+    return { sync: false, reason: "up-to-date-legacy" };
+  }
+  return { sync: true, reason: "no-stored-edit-time" };
+}
+
+// --------------------------------------------------------------------------
+// media download (incremental by default)
+// --------------------------------------------------------------------------
+
+function downloadMedia(token: string, opts: SyncOptions): boolean {
   const target = join(MEDIA_DIR, `${token}.png`);
-  if (existsSync(target)) return true;
-  // lark-cli rejects absolute --output paths. Run from MEDIA_DIR with a
-  // relative filename so the constraint is satisfied.
+  if (existsSync(target) && !opts.force) return true;
+  if (opts.dryRun) {
+    console.log(`[sync] (dry) media ${token}`);
+    return true;
+  }
   try {
     const quoted = [
       "docs",
@@ -521,6 +940,7 @@ function downloadMedia(token: string): boolean {
       timeout: 120_000,
       windowsHide: true,
       maxBuffer: 64 * 1024 * 1024,
+      stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (e) {
     console.error(
@@ -531,46 +951,150 @@ function downloadMedia(token: string): boolean {
   return existsSync(target);
 }
 
+// --------------------------------------------------------------------------
+// folder meta.json auto-generation
+// --------------------------------------------------------------------------
+
+function maybeWriteFolderMeta(
+  folderRel: string,
+  container: Node,
+  childrenSlugs: string[],
+  containerHasIndex: boolean,
+  opts: SyncOptions,
+) {
+  const metaPath = join(CONTENT_DIR, folderRel, "meta.json");
+  if (existsSync(metaPath)) return; // never overwrite hand-written meta
+  if (opts.dryRun) {
+    console.log(`[sync] (dry) meta ${folderRel}/meta.json`);
+    return;
+  }
+  const pages = [
+    ...(containerHasIndex ? ["index"] : []),
+    ...childrenSlugs,
+  ];
+  const meta = {
+    title: container.title.trim(),
+    defaultOpen: true,
+    pages,
+  };
+  mkdirSync(dirname(metaPath), { recursive: true });
+  writeFileSync(metaPath, `${JSON.stringify(meta, null, 2)}\n`, "utf8");
+  console.log(`[sync] ${folderRel}/meta.json (auto)`);
+}
+
+// --------------------------------------------------------------------------
+// main
+// --------------------------------------------------------------------------
+
+function parseArgs(argv: string[]): SyncOptions {
+  const flags = new Set(argv);
+  return {
+    force: flags.has("--force") || flags.has("-f") || flags.has("--clean"),
+    clean: flags.has("--clean"),
+    dryRun: flags.has("--dry-run"),
+  };
+}
+
 async function main() {
-  const argv = process.argv.slice(2);
-  const dryRun = argv.includes("--dry-run");
-  const noClean = argv.includes("--no-clean");
+  const opts = parseArgs(process.argv.slice(2));
+  const mode = opts.dryRun
+    ? "dry-run"
+    : opts.clean
+      ? "clean"
+      : opts.force
+        ? "force"
+        : "incremental";
+  console.log(`[sync] 模式: ${mode}`);
 
   console.log("[sync] 拉取 wiki 节点树…");
-  const nodes = flattenTree();
+  const { nodes, childrenOf } = flattenTree();
   console.log(`[sync] 共 ${nodes.length} 个节点`);
 
-  if (!noClean && !dryRun) {
-    cleanContentDir();
+  console.log("[sync] 拉取分享归档 bitable (slug 来源)…");
+  const bitableSlugByToken = loadBitableSlugMap();
+  console.log(`[sync] bitable 命中 ${bitableSlugByToken.size} 个 token → slug 映射`);
+
+  const byToken = new Map<string, Node>();
+  for (const n of nodes) byToken.set(n.node_token, n);
+
+  // Pre-scan disk so we can match new wiki paths against existing files,
+  // detect renames, and surface orphans without a hand-coded HANDWRITTEN list.
+  const existingFiles = scanExistingSyncedFiles();
+  const existingByToken = new Map<string, ExistingFile>();
+  for (const f of existingFiles) existingByToken.set(f.feishuToken, f);
+
+  if (opts.clean && !opts.dryRun) {
+    // Wipe everything the script owns:
+    //   1. .mdx files with `feishuToken` (the synced docs)
+    //   2. meta.json inside script-managed sub-folders (auto-gen by
+    //      maybeWriteFolderMeta — top-level meta.json is hand-written and
+    //      stays)
+    //   3. now-empty folders bubbled up to (but not including) CONTENT_DIR
+    //   4. all downloaded images
+    const managedFolders = new Set<string>();
+    for (const f of existingFiles) {
+      managedFolders.add(dirname(f.path));
+      rmSync(join(CONTENT_DIR, f.path), { force: true });
+    }
+    for (const folder of managedFolders) {
+      if (!folder || folder === ".") continue;
+      const metaPath = join(CONTENT_DIR, folder, "meta.json");
+      if (existsSync(metaPath)) rmSync(metaPath, { force: true });
+    }
+    pruneEmptyFolders(managedFolders);
     rmSync(MEDIA_DIR, { recursive: true, force: true });
+    existingByToken.clear();
   }
-  if (!dryRun) {
+  if (!opts.dryRun) {
     mkdirSync(CONTENT_DIR, { recursive: true });
     mkdirSync(MEDIA_DIR, { recursive: true });
   }
 
   const stamp = new Date().toISOString();
 
+  // First pass: fetch raw markdown for each docx so we can resolve `slug:`
+  // overrides (which may reference an ancestor's slug). Nodes that we don't
+  // need to sync (up-to-date) reuse the existing path entirely.
+  interface Pending {
+    node: Node;
+    rawMd: string;
+    rawXml: string;
+    targetRel: string;
+    decision: { sync: boolean; reason: string };
+  }
+  const pending: Pending[] = [];
+  const tokenToSlug = new Map<string, string>(); // node_token → slug segment
+
+  // Resolve slugs in two phases: first leaves with cached body, then
+  // ancestors using the cache. Containers may not need their own body
+  // fetched if we only care about their slug — but we need the body anyway
+  // (to write index.mdx) when the container itself owns content.
+  let skippedNoSlug = 0;
+  let skippedNonDocx = 0;
+  let skippedIgnored = 0;
+
+  // Phase 1: figure out which nodes are in scope and pre-fetch markdown
+  // (only when sync is needed).
   for (const node of nodes) {
-    const slug = PATH_MAP[node.node_token];
-    if (!slug) {
-      console.log(
-        `[sync] 跳过未映射节点: ${node.node_token} (${node.title.trim()})`,
-      );
+    if (node.obj_type !== "docx") {
+      skippedNonDocx++;
       continue;
     }
-    const filePath = join(CONTENT_DIR, `${slug}.mdx`);
-    const url = `${WIKI_URL_PREFIX}${node.node_token}`;
-    console.log(
-      `[sync] ${slug.padEnd(48)} ← ${node.obj_token} (${node.obj_type})`,
-    );
+    if (IGNORED_TOKENS.has(node.node_token)) {
+      skippedIgnored++;
+      continue;
+    }
+    if (hasIgnoredAncestor(node, byToken)) {
+      skippedIgnored++;
+      continue;
+    }
 
-    let body = "";
-    let media: string[] = [];
+    const existing = existingByToken.get(node.obj_token);
+    const decision = shouldSyncDocx(node, existing, opts);
 
-    if (node.obj_type === "docx") {
-      let rawMd = "";
-      let rawXml = "";
+    let rawMd = "";
+    let rawXml = "";
+    if (decision.sync) {
       try {
         rawMd = larkContent(node.obj_token, "markdown");
         rawXml = larkContent(node.obj_token, "xml");
@@ -580,50 +1104,318 @@ async function main() {
         );
         continue;
       }
-      const result = transformDocxMarkdown(rawMd, rawXml, node.title);
-      body = result.body;
-      media = result.mediaTokens;
+    }
 
-      // Empty container / placeholder → friendly placeholder body.
-      if (!body.trim()) {
-        if (node.has_child) {
-          body = "本节包含若干篇分享内容，请从左侧目录进入。\n";
-        } else {
-          body = `> 此页面暂未填充内容。原始飞书文档：[${node.title.trim()}](${url})\n`;
-        }
+    const slug = autoSlug(node, rawMd || undefined, bitableSlugByToken);
+    if (!slug) {
+      skippedNoSlug++;
+      console.log(
+        `[sync] ⚠ 无法生成 slug (标题为空或全是符号): ${node.node_token} (${node.title.trim()})`,
+      );
+      continue;
+    }
+    tokenToSlug.set(node.node_token, slug);
+    pending.push({ node, rawMd, rawXml, targetRel: "", decision });
+  }
+
+  // Phase 2: build target paths now that every in-scope node has a slug.
+  const ancestorSlug = (n: Node): string | null => {
+    const cached = tokenToSlug.get(n.node_token);
+    if (cached) return cached;
+    // Ancestor not in pending (e.g., its docx hasn't been fetched yet
+    // because we didn't need to sync it). Try its existing file path
+    // as the canonical slug, else slugify the title.
+    const existing = existingByToken.get(n.obj_token);
+    if (existing) {
+      const segs = existing.path.replace(/\.mdx$/, "").split("/");
+      const folder = segs.slice(0, -1).join("/");
+      const last = segs[segs.length - 1];
+      if (n.has_child) {
+        // container — its slug is its folder name (the parent of index)
+        if (last === "index") return segs[segs.length - 2] ?? null;
+        return folder.split("/").pop() ?? null;
       }
-    } else {
-      // bitable / sheet etc. — handled separately below.
-      console.log(`[sync] 跳过非 docx 节点 (${node.obj_type})`);
+      return last;
+    }
+    const auto = slugify(n.title);
+    return auto || null;
+  };
+
+  for (const p of pending) {
+    const parents = ancestorFolders(p.node, byToken, ancestorSlug);
+    if (parents == null) {
+      skippedNoSlug++;
+      continue;
+    }
+    const slug = tokenToSlug.get(p.node.node_token)!;
+    p.targetRel = p.node.has_child
+      ? [...parents, slug, "index.mdx"].join("/")
+      : [...parents, `${slug}.mdx`].join("/");
+  }
+
+  // Phase 3: write files and track what we touched
+  const writtenPaths = new Set<string>();
+  let synced = 0;
+  let skippedUpToDate = 0;
+  let renamedFromOld = 0;
+
+  for (const p of pending) {
+    if (!p.targetRel) continue;
+    writtenPaths.add(p.targetRel);
+
+    const filePath = join(CONTENT_DIR, p.targetRel);
+    const existing = existingByToken.get(p.node.obj_token);
+
+    // Detect rename: the doc lives somewhere else on disk under a different
+    // path. If we're refreshing content anyway, just delete the old file
+    // (the new one is written below). If the doc is up-to-date, move the
+    // file with renameSync so we don't lose content for nodes that didn't
+    // need a re-fetch.
+    const isRename =
+      existing !== undefined && existing.path !== p.targetRel;
+    if (isRename) {
+      console.log(`[sync] rename: ${existing.path} → ${p.targetRel}`);
+      renamedFromOld++;
+    }
+
+    if (!p.decision.sync) {
+      // Up-to-date: move old file to new path if needed; otherwise skip.
+      if (isRename && !opts.dryRun) {
+        const oldFull = join(CONTENT_DIR, existing.path);
+        const newFull = join(CONTENT_DIR, p.targetRel);
+        mkdirSync(dirname(newFull), { recursive: true });
+        // Windows renameSync errors if the target exists; clear it first.
+        if (existsSync(newFull)) rmSync(newFull, { force: true });
+        renameSync(oldFull, newFull);
+      }
+      skippedUpToDate++;
       continue;
     }
 
-    if (!dryRun) {
-      for (const tok of media) downloadMedia(tok);
+    // Refreshing content: delete the old file (if rename) before writing.
+    if (isRename && !opts.dryRun) {
+      rmSync(join(CONTENT_DIR, existing.path), { force: true });
+    }
+
+    console.log(
+      `[sync] ${p.targetRel.padEnd(48)} ← ${p.node.obj_token} (${p.decision.reason})`,
+    );
+
+    const result = transformDocxMarkdown(p.rawMd, p.rawXml, p.node.title);
+    let body = result.body;
+    const media = result.mediaTokens;
+
+    if (!body.trim()) {
+      if (p.node.has_child) {
+        body = "本节包含若干篇分享内容，请从左侧目录进入。\n";
+      } else {
+        const url = `${WIKI_URL_PREFIX}${p.node.node_token}`;
+        body = `> 此页面暂未填充内容。原始飞书文档：[${p.node.title.trim()}](${url})\n`;
+      }
+    }
+
+    if (!opts.dryRun) {
+      for (const tok of media) downloadMedia(tok, opts);
     }
 
     const fm = frontmatter({
-      title: node.title.trim(),
+      title: p.node.title.trim(),
       description: deriveDescription(body),
-      feishuToken: node.obj_token,
+      feishuToken: p.node.obj_token,
+      feishuEditTime: p.node.obj_edit_time,
       lastSyncedAt: stamp,
     });
     const finalContent = `${fm}\n${body}`;
-    if (!dryRun) {
+    if (!opts.dryRun) {
       mkdirSync(dirname(filePath), { recursive: true });
       writeFileSync(filePath, finalContent, "utf8");
     }
+    synced++;
   }
 
-  if (!dryRun) {
+  // Auto-generate per-folder meta.json for any container whose folder
+  // doesn't already have one.
+  let metasWritten = 0;
+  for (const p of pending) {
+    if (!p.node.has_child) continue;
+    if (!p.targetRel) continue;
+    const folderRel = dirname(p.targetRel); // e.g. "first-meeting"
+    const childrenWiki = childrenOf.get(p.node.node_token) ?? [];
+    const childrenSlugs: string[] = [];
+    for (const child of childrenWiki) {
+      if (IGNORED_TOKENS.has(child.node_token)) continue;
+      if (child.obj_type !== "docx") continue;
+      const childSlug = tokenToSlug.get(child.node_token);
+      if (childSlug) childrenSlugs.push(childSlug);
+    }
+    const before = existsSync(join(CONTENT_DIR, folderRel, "meta.json"));
+    maybeWriteFolderMeta(
+      folderRel,
+      p.node,
+      childrenSlugs,
+      /* containerHasIndex */ true,
+      opts,
+    );
+    if (!before && !opts.dryRun) metasWritten++;
+  }
+
+  // Rewrite meta.json `pages` references for any slug we just renamed.
+  // Top-level meta.json with hand-curated separators ("---分享会---") is
+  // preserved — only string entries matching a known rename are touched.
+  const slugRenames = collectSlugRenames(existingFiles, pending);
+  if (slugRenames.size > 0) {
+    const updated = rewriteMetaJsonReferences(slugRenames, opts);
+    if (updated.length > 0) {
+      console.log(
+        `[sync] meta.json 自动更新 ${updated.length} 处 slug 引用:`,
+      );
+      for (const u of updated) console.log(`        ${u}`);
+    }
+  }
+
+  if (!opts.dryRun) {
     syncShareArchive(stamp);
   }
 
+  // Orphan = was-synced file whose token is no longer in the wiki tree.
+  // (A renamed file isn't orphan — the same token is still synced, just at
+  // a new path — so we filter by token membership, not path membership.)
+  const syncedTokens = new Set(pending.map((p) => p.node.obj_token));
+  const orphans = existingFiles
+    .filter((f) => !syncedTokens.has(f.feishuToken))
+    .map((f) => f.path);
+  if (orphans.length > 0) {
+    console.log(
+      `[sync] ⚠ ${orphans.length} 个孤立同步文件 (token 已不在 wiki 中,可手动删除或 --clean 重置):`,
+    );
+    for (const o of orphans) console.log(`        ${o}`);
+  }
+
   console.log(
-    "[sync] 完成（手写文件已保留：" +
-      Array.from(HANDWRITTEN_FILES).join(", ") +
-      "）",
+    `[sync] 完成 — 同步 ${synced},未变化 ${skippedUpToDate},重命名 ${renamedFromOld},meta.json 新建 ${metasWritten},忽略 ${skippedIgnored},未映射 ${skippedNoSlug},非 docx ${skippedNonDocx}`,
   );
+}
+
+interface PendingForRename {
+  node: Node;
+  targetRel: string;
+}
+
+/**
+ * Walk every script-managed file and figure out which segment(s) of its
+ * path changed this run. The result maps `old-slug → new-slug` for any
+ * segment that genuinely renamed (folder names, file basenames). Used by
+ * rewriteMetaJsonReferences to keep meta.json in sync after renames.
+ */
+function collectSlugRenames(
+  existingFiles: ExistingFile[],
+  pending: PendingForRename[],
+): Map<string, string> {
+  const renames = new Map<string, string>();
+  for (const f of existingFiles) {
+    const p = pending.find((x) => x.node.obj_token === f.feishuToken);
+    if (!p || !p.targetRel || p.targetRel === f.path) continue;
+    const oldSegs = f.path.split("/");
+    const newSegs = p.targetRel.split("/");
+    if (oldSegs.length !== newSegs.length) continue;
+    for (let i = 0; i < oldSegs.length; i++) {
+      if (oldSegs[i] === newSegs[i]) continue;
+      const oldPiece = oldSegs[i].replace(/\.mdx$/, "");
+      const newPiece = newSegs[i].replace(/\.mdx$/, "");
+      if (oldPiece && newPiece && oldPiece !== newPiece) {
+        renames.set(oldPiece, newPiece);
+      }
+    }
+  }
+  return renames;
+}
+
+function rewriteMetaJsonReferences(
+  renames: Map<string, string>,
+  opts: SyncOptions,
+): string[] {
+  const updated: string[] = [];
+  if (!existsSync(CONTENT_DIR)) return updated;
+  const stack: string[] = [CONTENT_DIR];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    if (dir === undefined) break;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      if (entry.name !== "meta.json") continue;
+      const text = readFileSync(full, "utf8");
+      let json: unknown;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        continue;
+      }
+      if (
+        !json ||
+        typeof json !== "object" ||
+        !Array.isArray((json as { pages?: unknown }).pages)
+      ) {
+        continue;
+      }
+      const meta = json as { pages: unknown[] };
+      let touched = false;
+      const before = meta.pages.slice();
+      meta.pages = meta.pages.map((p) => {
+        if (typeof p !== "string") return p;
+        const next = renames.get(p);
+        if (next && next !== p) {
+          touched = true;
+          return next;
+        }
+        return p;
+      });
+      if (!touched) continue;
+      const rel = relative(CONTENT_DIR, full).replace(/\\/g, "/");
+      const renamePairs = before
+        .map((b, i) => [b, meta.pages[i]] as const)
+        .filter(([a, b]) => a !== b)
+        .map(([a, b]) => `${a} → ${b}`);
+      updated.push(`${rel}: ${renamePairs.join(", ")}`);
+      if (!opts.dryRun) {
+        writeFileSync(full, `${JSON.stringify(json, null, 2)}\n`, "utf8");
+      }
+    }
+  }
+  return updated;
+}
+
+/**
+ * After --clean removes script-owned files, walk each managed folder and
+ * delete it if empty, then bubble up to its parent. Stops at CONTENT_DIR
+ * so the docs root itself is never removed.
+ */
+function pruneEmptyFolders(managedFolders: Set<string>) {
+  // Process deepest paths first so child folders are evaluated before parents.
+  const ordered = [...managedFolders]
+    .filter((f) => f && f !== ".")
+    .sort((a, b) => b.split("/").length - a.split("/").length);
+  const visited = new Set<string>();
+  for (const folder of ordered) {
+    let dir = join(CONTENT_DIR, folder);
+    while (dir !== CONTENT_DIR && !visited.has(dir)) {
+      visited.add(dir);
+      if (!existsSync(dir)) {
+        dir = dirname(dir);
+        continue;
+      }
+      try {
+        if (readdirSync(dir).length > 0) break;
+      } catch {
+        break;
+      }
+      rmSync(dir, { recursive: true, force: true });
+      dir = dirname(dir);
+    }
+  }
 }
 
 function syncShareArchive(stamp: string) {
@@ -643,25 +1435,6 @@ function syncShareArchive(stamp: string) {
     console.error(
       `[sync] bitable archive 拉取失败: ${(e as Error).message.split("\n")[0]}`,
     );
-  }
-}
-
-function cleanContentDir() {
-  if (!existsSync(CONTENT_DIR)) return;
-  const stack: string[] = [CONTENT_DIR];
-  while (stack.length > 0) {
-    const dir = stack.pop();
-    if (dir === undefined) break;
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const full = join(dir, entry.name);
-      const rel = relative(CONTENT_DIR, full).replace(/\\/g, "/");
-      if (entry.isDirectory()) {
-        stack.push(full);
-        continue;
-      }
-      if (HANDWRITTEN_FILES.has(rel)) continue;
-      rmSync(full, { force: true });
-    }
   }
 }
 

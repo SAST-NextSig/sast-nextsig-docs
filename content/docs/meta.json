@@ -3,10 +3,10 @@
   "description": "南京邮电大学 SAST 的分享会知识库",
   "pages": [
     "index",
-    "getting-started",
+    "sast-next-sig-服用指南",
     "---分享会---",
-    "first-meeting",
-    "second-meeting",
+    "第一次分享会",
+    "第二次分享会",
     "---资料---",
     "archive",
     "components"

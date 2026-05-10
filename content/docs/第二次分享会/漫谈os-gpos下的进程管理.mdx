@@ -1,0 +1,685 @@
+---
+title: '漫谈os：GPOS下的进程管理'
+description: 'os（Operation Sysytem）在解决什么问题？'
+feishuToken: IXz4ds25joA05JximrocOiJrnhg
+feishuEditTime: 1778421831
+lastSyncedAt: '2026-05-10T15:57:55.941Z'
+---
+
+From Cube 
+
+os（Operation Sysytem）在解决什么问题？
+
+ 对于一个复杂的硬件结构，我们需要一个管理层，他需要指导我们做好三件事：
+
+ 第一、对于一个用户或者开发者来说，我们不希望在控制电脑的过程中，了解电脑的硬件结构，os给我们提供了一套被抽象后统一的接口；
+
+ 第二、我们希望在同一套硬件的基础上，尽可能地提高性能，最起码就要做到把CPU性能榨干，也就是说我们不希望看到的是,CPU在一个等待IO的地方死等，而是在这一段时间迅速地去其他进程执行任务，这就是os可以解决的CPU的调度问题；
+
+ 第三、作为用户，我们一般上不需要直接操作磁盘、修改内存映射等等；我们知道内存中会时刻存在多套独立的程序，我们也不希望看到一个进程的bug抑或是漏洞会直接导致整个系统的崩溃，os给了我们一套安全与隔离机制。
+
+**通用操作系统** 设计上面向用户，追求吞吐量与多任务公平性，引入了虚拟内存、写时拷贝（Copy-on-Write）、可抢占调度器等机制。
+
+**实时操作系统（RTOS）** 在设计上强调的是控制机械结构，追求轻量与确定性，其设计通常是对 GPOS 方案的裁剪与简化。本文以 GPOS 为主线，重点介绍CPU 的进程管理 。
+
+本次分享会基于树莓派5B4G，其硬件条件是：  
+
+> 飞书 sheet 嵌入块未在静态站点渲染，请[查看飞书原文](#)。
+
+## 执行流的抽象：进程与线程
+
+### 1.1 进程作为资源单位，线程作为调度单位
+
+Linux 内核中，进程和线程统一由 `task_struct` 表示，二者共享大部分内核数据结构。区别在于：
+
+- 进程拥有独立的 `mm_struct`（地址空间描述符）、文件描述符表等资源；
+- 同一线程组内的线程共享 `mm_struct` 和文件描述符表，仅持有独立的栈和部分寄存器上下文。
+
+调度器的基本调度单位即 `task_struct`——内核在调度时不区分进程与线程，均视为任务（task）。
+
+> 飞书 sheet 嵌入块未在静态站点渲染，请[查看飞书原文](#)。
+
+> **RTOS 对比**：RTOS 的 task 等价于 GPOS 的线程。RTOS 不设进程/线程层级，所有 task 共享同一物理地址空间，内核数据结构被高度裁剪。
+
+## 1.2 C语言演示
+
+```c
+#define _GNU_SOURCE
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
+
+void* thread_func(void* arg) {
+    printf("Thread: PID %d, TID %ld\n", getpid(), syscall(SYS_gettid));
+    sleep(60);
+    return NULL;
+}
+
+int main() {
+    pthread_t tid;
+    printf("Main:   PID %d, TID %ld\n", getpid(), syscall(SYS_gettid));
+    pthread_create(&tid, NULL, thread_func, NULL);
+    sleep(60);
+    return 0;
+}
+```
+
+![](/lark-media/CyF0bSEEyojK9AxR9zBcuQ8knDf.png)
+
+  
+ 我们新开一个终端并执行：  
+ ps -eLf | grep task_demo  
+ 
+
+![](/lark-media/HF9hbf17ionqgDxPgEKc2CAUnkV.png)
+
+ 这个东西大家应该都见过：
+
+- **UID**：`cube`，任务的拥有者
+- **PID**：进程 ID（用户视角的 PID，实际上是内核中的 TGID）
+- **PPID**：父进程 ID
+- **LWP**：内核调度用的线程 ID（`task_struct` 的 `pid`）
+
+- **`PID` 列完全相同（11713）**：说明这两个执行流**属于同一个进程**，从用户角度看它们共享一个 PID。
+- **`LWP` 列不同（11713 和 11714）**：内核为它们分配了**独立的线程 ID**，调度器以 LWP 为基本单位切换。  
+  
+ 这两个 `task_struct` 的 线程组ID 相同，所以它们共享：
+
+  - 虚拟地址空间（同一个 `mm_struct`）
+  - 文件描述符表
+  - 其他进程级别的资源
+
+## 进程结构与状态
+
+我们先了解一下进程的结构：
+
+对于一个进程，我们需要一个描述这个进程各项信息的档案，我们称其为PCB。
+
+在linux里面，PCB通过task_struct，一个描述进程的结构体实现，其成员包括：
+
+- 标识符：描述进程的唯一标识符，用来区别其他进程。
+- 状态：任务状态，退出状态，退出信号等等。
+- 优先级：相对于其他进程的优先级。
+- 程序计数器（PC）：程序中将要被执行的下一条指令的地址。
+- 内存指针：包括程序代码和进程相关数据的指针，还有和其他进程共享内存块的指针。
+- 上下文数据：进程执行时处理器中寄存器的数据。
+- I/O状态信息：包括显式的I/O请求，分配给进程的I/O设备和被进程使用的文件列表。
+- 记账信息：处理器时间综合，使用的时钟数综合，时间限制等。
+
+我们可以在/proc/（PID）/status中找到该进程的对应信息，这些信息本质上就是从PCB中提取出来的。
+
+我们要做到进程管理，需要对于一个进程设置其不同的状态。比较简单的就是如下的五状态模型：
+
+五个状态分别为 New、Ready、Running、Blocked、Exit。
+
+### 2.1 状态模型全景  
+
+![](/lark-media/Cm9Qb6Z5OoX8q9xFSHncsxG1n9d.png)
+
+### 2.2 各状态含义
+
+> 飞书 sheet 嵌入块未在静态站点渲染，请[查看飞书原文](#)。
+
+### 2.3 状态转换规则
+
+1. **New → Ready**：进程创建完成后被操作系统接纳，插入就绪队列。
+2. **Ready → Running**：调度器选中该进程，分配 CPU，该进程由就绪状态转变为运行状态。
+3. **Running → Ready**：时间片耗尽或被其他进程抢占，CPU 被剥夺，返回就绪队列。
+4. **Running → Blocked**：进程发起 I/O 请求或等待同步对象，主动让出 CPU。
+5. **Blocked → Ready**：等待的事件到达（I/O 完成、锁释放），被唤醒进入就绪队列。
+6. **Running → Exit**：进程执行完成或异常终止。
+
+五状态是了解进程管理的最简单模型，事实上在一个现代化的操作系统上更加复杂：
+
+> **Linux 内核的状态粒度**：Linux 将五状态展开为更细粒度的 `task_struct->__state` 常量，包括 `TASK_RUNNING`（合并 Ready 与 Running）、`TASK_INTERRUPTIBLE`/`TASK_UNINTERRUPTIBLE`（拆分 Blocked 为可被信号中断 / 不可被信号中断）、`TASK_STOPPED`/`TASK_TRACED`（Unix 信号与调试机制引入的额外状态）、以及 `EXIT_ZOMBIE`/`EXIT_DEAD`（Exit 的两个子阶段）。五状态模型作为教学抽象，是理解这些内核实现细节的起点。
+> 
+> **RTOS 对比**：RTOS 的任务状态模型是五状态的精简变体——去掉 New 和 Exit（RTOS 中任务批量创建/销毁），核心保留 Ready、Running、Blocked 三个运行期状态，外加一个 Suspended 作为主动挂起补充。
+
+## 虚拟内存：MMU 与写时拷贝
+
+### 3.1 页表与地址转换
+
+每个进程拥有一张页表，描述其虚拟地址到物理地址的映射。CPU 通过 **MMU（Memory Management Unit）** 完成地址转换：
+
+1. 从页表基址寄存器读取当前进程的顶级页表物理地址；
+2. 依据虚拟地址中的各级索引，逐级查找页表；
+3. 综合页内偏移量得到最终物理地址。
+
+![](/lark-media/Hr4LbZbkIocqSmxM2ESciRMAnZG.png)
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main() {
+    printf("PID: %d. Press Enter to allocate 256MB virtual...\n", getpid());
+    getchar();
+    char *p = malloc(256L*1024*1024);
+    printf("Allocated. Check VSS/RSS now.\n");
+    getchar();
+    for (long i=0; i<256L*1024*1024; i+=4096) p[i] = 0;
+    printf("Touched all pages. Check RSS now.\n");
+    getchar();
+    free(p);
+    return 0;
+}
+```
+
+编译运行获取PID，再执行watch -n 0.5 "cat /proc/PID/status | grep -E 'VmSize|VmRSS'"
+
+> 飞书 sheet 嵌入块未在静态站点渲染，请[查看飞书原文](#)。
+
+malloc只是承诺我们会给这个进程内存，但是实际上物理内存不交付；
+
+现在我们需要写入数据，此时触发缺页异常，于是物理内存才会被分出一块地方，此时这个PID下的物理内存空间增长
+
+free后，物理内存事实上不是立即坏给系统的，只有当最终进程退出后才会回收。
+
+### 3.2 写时拷贝（Copy-on-Write）
+
+进程创建的标准路径是 `fork()`。传统 `fork` 需完整复制父进程地址空间，现代系统通过写时拷贝优化此过程：
+
+1. `fork` 时不复制物理页，而是让父子进程共享全部物理页，并将各页的页表项标记为**只读**；
+2. 任意进程尝试写入某一页时，CPU 因写入只读页触发缺页异常；
+3. 内核缺页异常处理程序识别出写时拷贝场景，为该页分配新物理页，拷贝原内容，更新页表项为可写，随后重新执行写入指令。
+
+从汇编层面看，当进程执行写内存指令（如 `mov [rax], ebx`）时，硬件自动查询页表并检查权限。若权限检查失败，硬件跳转至缺页异常处理程序。写时拷贝将进程创建的开销从拷贝全部物理页压缩为仅复制页表结构，物理页的实际分配被推迟到真正需要写入时才发生。
+
+## 3.3 写时拷贝的C语言实现
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+#define SIZE 10*1024*1024  
+
+int main() {
+    char *buf = malloc(SIZE);
+    for (int i=0; i<SIZE; i+=4096) buf[i] = 1;
+    printf("Before fork: PID=%d\n", getpid());
+    getchar();
+
+    pid_t pid = fork();
+    if (pid == 0) {
+    printf("Child PID=%d, press Enter to modify memory...\n", getpid());
+    getchar();
+    for (int i=0; i<SIZE; i+=4096) buf[i] = 2;
+    printf("Child modified memory. Press Enter to exit...\n");
+    getchar();
+    exit(0);
+        } else {                  
+        wait(NULL);
+        printf("Parent: child finished.\n");
+    }
+    return 0;
+}
+```
+
+ 显示fork前的PID，我们新开一个终端
+
+ 执行 cat /proc/（PID）/smaps | less
+
+ 我们会找到一段映射的地址，size约在10240KB
+
+ cat /proc/11897/smaps | grep -A 25 "7ffee588c000-7ffee6290000"
+
+![](/lark-media/XO9Rb5ULWouVmRxmNxzcokLGnfd.png)
+
+ 现在我们回车一下，拿到一个子进程
+
+ 现在我们查看统一映射地址下的父子进程：
+
+![](/lark-media/P60NbcsmVolfm7xXlxoc2VJonNh.png)
+
+![](/lark-media/Y1oobtukloaShhxvNj4cR1R1nJc.png)
+
+ 我们可以看到前后变化的数据有三：
+
+char buf = malloc(SIZE);
+
+ 这一步父进程申请了一块10MB的私有脏页，此时该进程享有完全的物理内存；在GPOS下创建子进程之后，我们看到每一个进程都平分了之前申请的空间， 也就是父子进程各拿到5MB的空间。
+
+ 我们再一次回车，使子进程写入：
+
+![](/lark-media/CP65byPSFoynldx3NSGcQ2Dgnub.png)
+
+![](/lark-media/TgiLb9Pm9obUBUxBbO5c5yj5nvc.png)
+
+当子进程写入后，由于当前父子进程平分了最初的进程，现在要触发缺页复制，我们看到现在父子进程都各有了独享的（Share_Dirty = 0）物理页，现在总占用空间翻倍。
+
+在这个例子中，当父进程被fork一份给子进程后，内核会将他们的存储改为只读。
+
+现在，我们希望给 buf[i] = 2 ,事实上就是我们试图去写入一个只读的文件，所以此时父子进程不可以再共享一片空间，而是各自独立。
+
+> **RTOS 对比**：多数 RTOS 无 MMU，不设页表和写时拷贝。任务直接操作物理地址，隔离由编程约定保证。少数配备 MPU（Memory Protection Unit）的 RTOS 可实现区域保护，但不提供独立地址空间。
+
+## 创建与执行：fork 与 execve
+
+### 4.1 fork 的双重返回机制
+
+`fork` 系统调用在父进程和子进程中均返回，但返回值不同：父进程从返回值寄存器中获得子进程 PID，子进程获得 0。其实现机制如下：
+
+1. 用户程序执行 `syscall` 指令（或 `int 0x80`）陷入内核；
+2. 内核复制当前进程的 `task_struct`，分配新 PID，按写时拷贝方式复制页表，分配新内核栈；
+3. 关键步骤：子进程的内核栈被构造成**与父进程系统调用返回时相同的现场**，仅将存放返回值的寄存器设为零；父进程的同一寄存器则设为子进程 PID；
+4. 当父子进程先后被调度返回用户态时，读取到的返回值不同，形成 `fork` 双重返回的效果。
+
+x86-64 系统调用返回值通常存放于 `rax`。内核完成处理后恢复用户态寄存器（含 `rax`），通过 `sysret`/`iretq` 返回用户态。
+
+### 4.2 execve 
+
+`execve` 用于在当前进程中加载并执行新程序：
+
+1. 释放旧的 `mm_struct`（内存管理结构），依据 ELF 文件格式建立新的虚拟地址空间；
+2. 将 ELF 的代码段、数据段等映射至指定虚拟地址；
+3. 设置用户栈，按 ABI 约定将命令行参数、环境变量压入栈中；
+4. 将程序入口地址（ELF 头中 `e_entry` 字段）填入上下文中的 `rip`（x86-64）或 `pc`（ARM）；
+5. 内核通过 `sysret` 或 `eret` 返回用户态时，CPU 从新程序入口开始执行。
+
+此过程中，页表切换与内存映射由内核操控硬件寄存器完成，用户态仅观测到系统调用后执行流发生变化。
+
+> **RTOS 对比**：RTOS 的任务创建（如 `xTaskCreate`）直接分配栈空间，在栈顶手工写入初始化上下文（包括指向任务函数的 PC 与参数）。无虚存管理，无 ELF 装载，流程简单且执行时间确定。
+
+## 调度与上下文切换
+
+### 5.1 调度触发时机
+
+GPOS 的调度主要在以下时机发生：
+
+- **系统调用返回**或**中断返回**前夕，内核检查 `need_resched` 标志；
+- **时钟中断**到达时，当前任务时间片耗尽，内核设置重新调度标志。
+
+以 Linux 为例，中断处理结束后调用 `schedule()`，该函数选择下一个运行任务并执行上下文切换。
+
+## 5.2 调度抢占
+
+```c
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/time.h>
+
+volatile int running = 1;
+
+void* low_prio(void* arg) {
+    struct timeval tv;
+    while (running) {
+        gettimeofday(&tv, NULL);
+        printf("[LOW]  %ld.%06ld\n", tv.tv_sec, tv.tv_usec);
+        usleep(100000);
+    }
+    return NULL;
+}
+
+void* high_prio(void* arg) {
+    struct timeval tv;
+    struct sched_param param = { .sched_priority = 99 };
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+
+    for (int i=0; i<10; i++) {
+        gettimeofday(&tv, NULL);
+        printf("[HIGH] %ld.%06ld  (iteration %d)\n", tv.tv_sec, tv.tv_usec, i);
+        for (volatile long j=0; j<50000000; j++); // 忙等
+    }
+    running = 0;
+    return NULL;
+}
+
+int main() {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);       
+    pthread_setaffinity_np(low, sizeof(cpu_set_t), &cpuset);
+    pthread_setaffinity_np(high, sizeof(cpu_set_t), &cpuset);
+    pthread_t low, high;
+    pthread_create(&low, NULL, low_prio, NULL);
+    pthread_create(&high, NULL, high_prio, NULL);
+    pthread_join(high, NULL);
+    pthread_join(low, NULL);
+    return 0;
+}
+```
+
+编译prio_printf.c并sudo setcap cap_sys_nice=ep ./prio_printf运行。
+
+![](/lark-media/Wp5pbBfscoiUZmxsCn6cRaufnsy.png)
+
+首先在代码中，我们把所有任务强绑定在CPU0上执行，这只是为了演示，避免多个CPU将我们的两个不同优先级的任务同步执行。
+
+我们为这个high_prio设置了SCHED_FIFO策略,优先级99,在linux内核里面，逝世人物的优先级永远高于普通任务。
+
+在高优先级任务里面，我们又使用一个死的for循环强行把CPU拉在高优先级的任务中（理论上来说，printf的阶段可能会存在低优先级任务执行一次的情况，因为此时CPU正在IO阻塞中，此时CPU会被调度到低优先级任务执行）
+
+linux中默认的调度策略叫作分时调度策略，使用完全公平调度器，所有普通线程按优先级的权重分享CPU时间。
+
+SCHED_FIFO：先进先出实时调度，他的特点一是优先级静态，我们设置其为99，则不会被内核动态分配；二是其优先级一定高于普通任务，所以他会一直抢占着低优先级任务的CPU。
+
+实时调度策略必须在sudo情况下设置CAP_SYS_NICE能力，才可以使高优先级任务的实时调度策略生效。
+
+### *5.3 上下文切换的实现*
+
+*上下文切换的核心是 `switch_to` 宏（或 `context_switch` 内联汇编），其功能为保存当前任务的寄存器状态并恢复下一任务的寄存器状态。x86-64 平台上需处理的内容包括：*
+
+- *需被调用者保存的通用寄存器*
+- *栈指针 `rsp`，切换至新任务的内核栈；*
+- *指令指针 `rip`，恢复至新任务的断点位置；*
+- *段寄存器，以及必要的浮点/向量寄存器（`x87`/`SSE`/`AVX` 状态）。*
+
+*此段代码通常以手写汇编实现以控制开销：*
+
+```plain Text
+    /* 保存当前任务 */
+    pushq %rbp
+    pushq %rbx
+    /* ... */
+    movq %rsp, PREV_TASK->thread.sp
+    /* 恢复下一任务 */
+    movq NEXT_TASK->thread.sp, %rsp
+    /* ... */
+    popq %rbx
+    popq %rbp
+    ret
+```
+
+*调用者保存寄存器（`rax`、`rcx`、`rdx` 等）在进入 `schedule()` 时已由编译器压入栈帧，从 `switch_to` 返回后将自然恢复，无需在此处显式处理。*
+
+![](/lark-media/ZlEDbSzvAo9qCuxXN2wcqUcAnpc.png)
+
+![](/lark-media/WNNNbgGgCoTObfx7IWLcDzKZng0.png)
+
+### 5.4 进程切换与线程切换的开销差异
+
+若切换的两个 `task_struct` 属于不同进程（`mm_struct` 不同），内核额外执行：
+
+- 加载新进程的页表（`mov cr3, next->pgd`，或 ARM 的 `TTBR0_EL1`）；
+- 该操作导致 TLB 刷新（除非启用 PCID 等硬件优化）。
+
+线程切换因共享地址空间，无需更新 CR3，开销显著降低。这也是 I/O 密集型服务普遍采用多线程模型的原因之一。
+
+## 5.5 **上下文切换的开销**
+
+```c
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <sched.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <string.h>
+#include <errno.h>
+
+#define ITER 100000
+
+/* ================= 线程版本 ================= */
+pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+int flag = 0;
+
+void* thread_pong(void* arg) {
+    for (int i = 0; i < ITER; i++) {
+        pthread_mutex_lock(&mtx);
+        while (flag == 0)
+            pthread_cond_wait(&cond, &mtx);
+        flag = 0;
+        pthread_mutex_unlock(&mtx);
+        pthread_cond_signal(&cond);
+    }
+    return NULL;
+}
+
+void test_thread() {
+    pthread_t tid;
+    struct timeval t1, t2;
+
+    pthread_create(&tid, NULL, thread_pong, NULL);
+
+    gettimeofday(&t1, NULL);
+    for (int i = 0; i < ITER; i++) {
+        pthread_mutex_lock(&mtx);
+        flag = 1;
+        pthread_cond_signal(&cond);
+        while (flag == 1)
+            pthread_cond_wait(&cond, &mtx);
+        pthread_mutex_unlock(&mtx);
+    }
+    gettimeofday(&t2, NULL);
+    pthread_join(tid, NULL);
+
+    long long us = (t2.tv_sec - t1.tv_sec) * 1000000LL + t2.tv_usec - t1.tv_usec;
+    printf("Thread switch:  %lld us total, avg %.1f ns\n", us, (double)us * 1000 / ITER);
+}
+
+/* ================= 进程版本 ================= */
+/*
+ * 使用命名信号量进行乒乓同步：
+ *   sem_parent : 父进程等待，子进程释放
+ *   sem_child  : 子进程等待，父进程释放
+ * 共享内存用于传输一个字节（虽然我们只用它来验证数据传递，但乒乓主要靠信号量）。
+ */
+static void test_process() {
+    // 创建并初始化两个信号量
+    sem_t *sem_parent = sem_open("/pingpong_parent", O_CREAT | O_EXCL, 0644, 0);
+    sem_t *sem_child  = sem_open("/pingpong_child",  O_CREAT | O_EXCL, 0644, 0);
+    if (sem_parent == SEM_FAILED || sem_child == SEM_FAILED) {
+        perror("sem_open");
+        exit(EXIT_FAILURE);
+    }
+
+    // 分配共享内存，虽然这里只用来传递一个无关字节（可选）
+    // 实际乒乓只靠信号量完成，不依赖共享变量。
+    void *shared = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        perror("mmap");
+        exit(EXIT_FAILURE);
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(EXIT_FAILURE);
+    }
+
+    if (pid == 0) { // 子进程
+        for (int i = 0; i < ITER; i++) {
+            sem_wait(sem_child);      // 等待父进程释放
+            // ////
+            sem_post(sem_parent);     // 通知父进程
+        }
+        exit(0);
+    } else {         // 父进程
+        struct timeval t1, t2;
+        gettimeofday(&t1, NULL);
+
+        for (int i = 0; i < ITER; i++) {
+            sem_post(sem_child);      // 释放子进程 （0 -- 1）
+            // 父进程--》阻塞，让出CPU，触发上下文切换
+            sem_wait(sem_parent);     // 等待子进程回复，子进程设置1
+            // 调度器接入，进程上下文切换
+        }
+
+        gettimeofday(&t2, NULL);
+        wait(NULL);                   // 回收子进程
+
+        long long us = (t2.tv_sec - t1.tv_sec) * 1000000LL + t2.tv_usec - t1.tv_usec;
+        printf("Process switch: %lld us total, avg %.1f ns\n", us, (double)us * 1000 / ITER);
+
+        // 清理
+        munmap(shared, sizeof(int));
+        sem_close(sem_parent);
+        sem_close(sem_child);
+        sem_unlink("/pingpong_parent");
+        sem_unlink("/pingpong_child");
+    }
+}
+
+/* ================= 主函数 ================= */
+int main() {
+    printf("Measuring context switch overhead (iterations = %d)\n\n", ITER);
+    test_thread();
+    test_process();
+    return 0;
+}
+```
+
+编译执行switch.c
+
+> **RTOS 对比**：RTOS 无页表切换，仅需保存/恢复整数通用寄存器、PC、SP，浮点寄存器默认不保存（除非显式声明需求）。切换代码体积极小，延迟可精确至微秒级，符合实时系统需求。
+
+## 同步与通信：原子操作支撑
+
+### 6.1 自旋锁与原子指令
+
+比如说两个CPU核同时执行一句指令，这种现象叫作数据竞争。我们的变量无法做到读/改/写是不可分割的。
+
+在不同架构的CPU上我们提供了不同的方式：  
+x86 架构提供 `LOCK` 前缀，以LOCK为前缀的指令在进入EX阶段时会锁定内存总线，确保当前变量有且仅有这一个核访问。  
+这些指令在 CPU 缓存一致性协议（如 MESI/MOESI）的协调下，保证多处理器间的原子语义。
+
+### 6.2 Futex：用户态与内核态协同
+
+用户态互斥锁（如 `pthread_mutex`）在无竞争时完全在用户空间通过原子操作完成；发生竞争时才通过 **`futex`系统调用**进入内核挂起任务。
+
+```c
+// 用户态加锁逻辑
+while (atomic_compare_exchange_weak(&lock->val, 0, 1)) {
+    // 获取失败，进入内核挂起
+    syscall(SYS_futex, &lock->val, FUTEX_WAIT, 1, NULL);
+}
+```
+
+> 飞书 sheet 嵌入块未在静态站点渲染，请[查看飞书原文](#)。
+
+> **RTOS 对比**：RTOS 的互斥锁通常内置优先级继承机制以解决优先级反转问题。不存在用户态/内核态切换，信号量的 `pend/post` 操作仅修改 TCB 状态并可能触发任务调度，实现路径极短。
+
+## 系统调用：用户态到内核态的切换
+
+说到用户态以及内核态，我们要先说一下CPU的指令集。现代化的CPU的指令集非常复杂，尤其是涉及到底层的操作对于整个系统来说都非常危险，因此我们分了多个等级，越接触底层的等级能够操作的指令集越多也越底层。
+
+其中，我们把最上层的叫作用户态，最底层的叫作内核态。
+
+> 飞书 sheet 嵌入块未在静态站点渲染，请[查看飞书原文](#)。
+
+> CSR是特权级别切换与管理的唯一窗口。
+> 
+> 特权级别由高到低是M(机器模式)、S（特权模式）、U（用户模式）。
+> 
+> - M：对硬件有绝对控制权。在嵌入式开发中，简单的 RTOS 或裸机代码通常运行在这里（这是因为RTOS一般部署在比较简单的硬件设备上，而这些硬件设备不会设置特权级别）。
+> - S : 运行操作系统内核。可以管理虚拟内存和大部分外设。
+> - U: 运行普通的应用程序。无法执行敏感指令。
+> 
+> 事实上还有一个调试模式，这个模式只可以通过硬件信号触发，此时调试器可以观察和修改CPU所有状态，部分空间即使是M也做不到。
+> 
+> 最低特权级别:要访问这个寄存器，你当前的 CPU 至少得处于哪种模式。
+
+用户程序访问内核服务（文件操作、线程创建、内存映射等）必须通过系统调用。以 x86-64 Linux 为例的标准流程：
+
+1. 用户程序将系统调用号存入 `rax`，参数依次存入 `rdi`、`rsi`、`rdx`、`r10`、`r8`、`r9`；
+2. 执行 `syscall` 指令，CPU 执行以下操作： 
+
+   - 将返回地址 `rip` 存入 `rcx`，`rflags` 存入 `r11`；
+   - 从 MSR（Model-Specific Register）加载内核入口地址至 `rip`，新栈指针至 `rsp`；
+   - 切换至内核态（CPL=0）；
+3. 内核入口代码（`entry_SYSCALL_64`）压栈保存用户态寄存器，构建完整 `pt_regs` 结构，分发至对应系统调用函数；
+4. 处理完成后通过 `sysretq` 返回用户态，恢复 `rip` 与 `rflags`。
+
+此过程涉及 CPU 特权级切换、栈切换与寄存器保存/恢复，由硬件机制与内核约定共同完成。
+
+```c
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+
+#define ITER 50000000
+
+int main() {
+    struct timespec t1, t2;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    for (volatile long i=0; i<ITER; i++);
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    long long base = (t2.tv_sec - t1.tv_sec)*1000000000LL + t2.tv_nsec - t1.tv_nsec;
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    for (volatile long i=0; i<ITER; i++) syscall(SYS_getpid);
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    long long sys = (t2.tv_sec - t1.tv_sec)*1000000000LL + t2.tv_nsec - t1.tv_nsec;
+
+    printf("Empty loop: %lld ns\n", base);
+    printf("Syscall per iteration: %lld ns\n", (sys - base)/ITER);
+    return 0;
+}
+```
+
+编译运行
+
+![](/lark-media/JZ5rb4tJqowC2Jxc3PqcUNManuh.png)
+
+## 总结
+
+GPOS 的进程管理建立在硬件与软件的协同之上：MMU 提供隔离基础，写时拷贝与 futex 将性能优化推进到指令级，上下文切换和系统调用路径经过汇编级别的精细调校。RTOS 则通过裁剪虚拟内存、简化调度器等方式换取确定性与低延迟。二者在同一套硬件机制上，呈现了不同设计目标下的分化路径。
+
+## 网卡中断与软中断机制
+
+**演示步骤**
+
+发送洪水 ping：
+
+```bash
+ping -f -s 1400 <树莓派IP>
+```
+
+中断计数急速增长。同时观察 `ksoftirqd` 的 CPU 占用：
+
+```bash
+mpstat -P ALL 1
+```
+
+我们看到的现象：
+
+![](/lark-media/ObYXbkOuKoJvFbx3TUicb9Uinob.png)
+
+## %irq
+
+硬件中断（上半部）**并没有消失**，只是它的单次执行时间极短（几十到几百纳秒）。  
+`mpstat` 是每秒采样一次，统计各个状态所占的 CPU 时间**百分比**。  
+在上亿纳秒的时间窗口里，哪怕发生了数万次硬中断，只要 ISR 足够短，累积的时间占比也可能小于 0.01 %，于是显示为 `0.00`。  
+这就是上半部的设计目标：**闪电进出**，几乎不占用可见的 CPU 时间。
+
+## **%soft**
+
+硬件中断结束后，内核会触发 `NET_RX_SOFTIRQ`（网络接收软中断）或 `NET_TX_SOFTIRQ`（发送软中断）。  
+这部分工作在 `ksoftirqd` 或 `softirq` 上下文中执行，统计在 `%soft` 列。  
+在洪水 ping 的场景下，接收回复或发送完成后的清理会累积成可观测的 4 % 软中断 CPU 占用。
+
+## %sys
+
+这是**最关键的现象**，解释了除中断外的大量内核时间去哪了。
+
+洪水 ping（特别是 `ping -f`）的本质是**极高频地调用** `sendmsg` **/** `recvmsg` **系统调用**，每个 ICMP 包都要经过：
+
+- 用户态 → 内核态（`syscall`）
+- 内核协议栈构建 ICMP 报文、路由查找、ARP 查询
+- 将数据包交给网卡驱动的发送队列
+- 等待回复、从 socket 缓冲区读取数据
+
+**所有这一切都是在内核态的系统调用上下文里完成的，被计入** `%sys`。  
+这几个步骤比硬件中断重得多，所以 37 % 的内核 CPU 正是洪水 ping 本身产生的协议栈开销。
+
+> 飞书 sheet 嵌入块未在静态站点渲染，请[查看飞书原文](#)。

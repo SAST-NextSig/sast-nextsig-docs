@@ -1,0 +1,9 @@
+{
+  "title": "第二次分享会",
+  "defaultOpen": true,
+  "pages": [
+    "index",
+    "漫谈os-gpos下的进程管理",
+    "next-sig-内网穿透与虚拟组网"
+  ]
+}

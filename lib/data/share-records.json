@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-05-10T01:59:13.910Z",
+  "updatedAt": "2026-05-10T15:57:55.941Z",
   "records": [
     {
       "speaker": "Max Qian",
@@ -49,7 +49,11 @@
     {
       "speaker": "sean",
       "date": "2026-05-10",
-      "title": "NAT Traversal & Virtual Networking"
+      "title": "NAT Traversal & Virtual Networking",
+      "link": {
+        "text": "Next SIG | 内网穿透与虚拟组网 - SeanDictionary | 折腾日记",
+        "url": "https://seandictionary.top/next-sig-net-proxy-vpn/"
+      }
     }
   ]
 }

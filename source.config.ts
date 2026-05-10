@@ -22,7 +22,44 @@ export const docs = defineDocs({
       tags: z.array(z.string()).optional(),
     }),
     postprocess: {
-      includeProcessedMarkdown: true,
+      // Custom stringify: when a `<Mermaid chart="..." />` JSX node (emitted
+      // by lib/remark-mermaid.ts) is serialised for /llms.mdx and friends,
+      // turn it back into a ```mermaid fenced code block. Without this the
+      // default "children-only" treatment for unknown JSX flow elements
+      // would drop the chart from the LLM-facing markdown entirely.
+      includeProcessedMarkdown: {
+        stringify(node) {
+          if (
+            node &&
+            typeof node === "object" &&
+            "type" in node &&
+            (node as { type: string }).type === "mdxJsxFlowElement" &&
+            "name" in node &&
+            (node as { name?: string }).name === "Mermaid"
+          ) {
+            const attrs = (
+              node as {
+                attributes?: Array<{
+                  type: string;
+                  name?: string;
+                  value?: unknown;
+                }>;
+              }
+            ).attributes;
+            const chartAttr = attrs?.find(
+              (a) => a.type === "mdxJsxAttribute" && a.name === "chart",
+            );
+            const raw = chartAttr?.value;
+            const chart =
+              typeof raw === "string"
+                ? raw
+                : raw && typeof raw === "object" && "value" in raw
+                  ? String((raw as { value: unknown }).value ?? "")
+                  : "";
+            return `\`\`\`mermaid\n${chart}\n\`\`\``;
+          }
+        },
+      },
     },
   },
   meta: {

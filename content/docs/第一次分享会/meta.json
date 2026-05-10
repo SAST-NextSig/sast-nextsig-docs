@@ -1,0 +1,11 @@
+{
+  "title": "第一次分享会",
+  "defaultOpen": true,
+  "pages": [
+    "index",
+    "why-proxy-traffic-gets-detected",
+    "上下文工程",
+    "tool-use",
+    "cloudflare-tunnel-deployment"
+  ]
+}

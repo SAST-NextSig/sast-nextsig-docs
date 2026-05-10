@@ -1,0 +1,434 @@
+---
+title: 'Next SIG | 内网穿透与虚拟组网'
+description: '可是我的家宽没有公网IP，使得我在外无法访问到家里的电脑'
+feishuToken: CQdWdPQk1og5iPx4GUIcjFlLnyf
+feishuEditTime: 1778417931
+lastSyncedAt: '2026-05-10T15:57:55.941Z'
+---
+
+From Sean 
+
+设想一下下列几种场景
+
+1. 我的电脑开机放在家里，但我人在外面需要控制电脑或者传一些文件。  
+可是我的家宽没有公网IP，使得我在外无法访问到家里的电脑
+2. 我学校的网关设置了严格的防火墙，只允许特定端口访问
+3. 我和我的好基友不在同一个局域网下，却想要MC联机（特指JAVA版）
+
+## SSH 隧道穿透
+
+### -L 本地端口转发
+
+`ssh -L [本地端口]:[远程端口] [远程用户]@[远程地址]`
+
+`ssh -L [本地端口]:[目标地址]:[目标端口] [跳板机用户]@[跳板机地址]`
+
+这两种命令写法，都是通过ssh将远程的端口转发到本地，从而可以直接通过 `localhost``:port` 对该端口发送请求等等。
+
+例如，有一台局域网内的web服务器，只对 `127.0.0.1` 或局域网内开放，那么此时局域网外的电脑可以通过本地端口转发，将这台服务器的 80 或 443 端口转发到本地，于是可以通过 `127.0.0.1` 访问到web内容
+
+通过SSH转发的端口一般默认只开放在 `127.0.0.1` 上，如果想要额外对局域网开放的活需要写成如下形式
+
+`ssh -g -L [本地端口]:[目标地址]:[目标端口] [跳板机用户]@[跳板机地址]`
+
+`ssh -L 0.0.0.0:[本地端口]:[目标地址]:[目标端口] [跳板机用户]@[跳板机地址]`
+
+### -R 远程端口转发
+
+`ssh -R [远程端口]:[本地IP]:[本地端口] [跳板机用户]@[跳板机地址]`
+
+这个命令可以将本地开放的端口通过SSH开放到跳板机上，以此可以通过访问跳板机的对应端口，从而直接访问到本地开放的服务
+
+### -D 动态端口转发
+
+`ssh -D [本地端口] [跳板机用户]@[跳板机地址]`
+
+这个可以直接固定一个端口用作全局的流量出口，并配合系统代理设置，可以将所有的流量从该本地端口发送到跳板机，再通过跳板机访问所有可达地址
+
+最简单的系统代理设置，就是直接在命令行中指定代理
+
+```bash
+# 设置 SOCKS5 代理（对应 ssh -D）
+export all_proxy=socks5://127.0.0.1:7897
+
+# 或者分别设置 HTTP 和 HTTPS
+export http_proxy=http://127.0.0.1:7898
+export https_proxy=http://127.0.0.1:7899
+```
+
+这里的变量设置是临时的，如果想要持久化的代理设置，可以对应的修改 `~/.bashrc` 这类文件
+
+其他更多的代理设置方式，会在后面的工具介绍里提及
+
+## Frp
+
+frp实现的功能和上一节SSH中的作用大部分其实是一样的，但是会发现SSH的连接是一次性的，如果中间出现断连或波动，需要重新连接，而frp则不用担心。此外frp还有更多ssh不支持的功能，例如协议支持，多路复用等等
+
+[[Github] fatedier/frp](https://github.com/fatedier/frp)
+
+| **特性** | **SSH -R** | **Frp** |
+|-|-|-|
+| **稳定性** | 易断线，需配合 AutoSSH，无内置重连。 | 内置连接池和心跳检测，重连极其稳定。 |
+| **协议支持** | 仅限 TCP。 | TCP, UDP, HTTP, HTTPS, STCP 等。 |
+| **多路复用** | 一个映射通常对应一个 SSH 进程。 | 单条隧道多路复用，一个连接跑成百上千个端口。 |
+| **应用层感知** | 无（只能按端口分）。 | 强（支持按域名/Host 分发）。 |
+| **穿透能力** | 仅限服务器转发（中转）。 | 支持 P2P 打洞 (xtcp)，流量不经过服务器。 |
+
+frp分为两个部分frps和frpc分别用作服务端和客户端，这比 SSH 的单一进程更专业：
+
+**frps (frp server):** 运行在拥有**公网 IP** 的服务器上。
+
+- 它负责监听来自公网的请求，并管理所有的内网连接。
+
+**frpc (frp client):** 运行在**内网设备**上。
+
+- 它主动连接 `frps`，并告知：“我这里有哪些端口需要你帮忙发出去”。
+
+frps/frpc启动时需要指定toml文件用作运行参数
+
+`frpc -c ./xxx.toml`
+
+### 端口转发
+
+同样的frp可以实现和ssh类似的端口转发的功能，这里展示一下最简单的转发配置
+
+```toml
+# frps.toml
+bindPort = 7000
+
+auth.method = "token"
+auth.token = "password"
+
+webServer.addr = "0.0.0.0"
+webServer.port = 7500
+webServer.user = "admin"
+webServer.password = "password"
+```
+
+```toml
+# frpc.toml
+serverAddr = "x.x.x.x"
+serverPort = 7000
+
+auth.method = "token"
+auth.token = "password"
+
+[[proxies]]
+name = "proxy1"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 5000
+remotePort = 8000
+
+[[proxies]]
+name = "proxy2"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 5001
+remotePort = 8001
+```
+
+### 异地反向代理
+
+不光可以进行端口转发，frp还可以用于异地反向代理，类似于Nginx的作用，但区别在于Nginx至少要求反代的服务器地址需要再一个网络内是可达的，但是frp可以通过内网穿透，将异地服务器用于反向代理。
+
+```toml
+# frps.toml
+bindPort = 7000
+vhostHttpPort = 80
+vhostHttpsPort = 443
+```
+
+```toml
+# frpc.toml
+serverAddr = "x.x.x.x"
+serverPort = 7000
+
+[[proxies]]
+name = "web-blog"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 8081
+customDomains = ["blog.example.com"]
+
+[[proxies]]
+name = "web-cloud"
+type = "https"
+localIP = "127.0.0.1"
+localPort = 8082
+customDomains = ["cloud.example.com"]
+```
+
+这里的配置可以等效成如下Nginx配置
+
+```nginx
+server {
+    listen 80;
+    listen 443 ssl;
+    server_name blog.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8081;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name cloud.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8082;
+    }
+}
+```
+
+### P2P打洞
+
+前面描述的过程都需要经过公网服务器进行中转，将流量转发到本地。会占用服务器自身的带宽
+
+frp还提供了另一种模式xtcp可以借助NAT在公网的地址，实现不经过公网服务器的P2P打洞
+
+```toml
+# frps.toml
+bindPort = 7000
+bindUdpPort = 7001
+```
+
+```toml
+# frpc_provider.toml
+serverAddr = "x.x.x.x"
+serverPort = 7000
+
+[[proxies]]
+name = "p2p"
+type = "xtcp"
+localIP = "127.0.0.1"
+localPort = 22
+secretKey = "password"
+```
+
+```toml
+# frpc_visitor.toml
+serverAddr = "x.x.x.x"
+serverPort = 7000
+
+[[visitors]]
+name = "p2p_visitor"
+type = "xtcp"
+serverName = "p2p"
+secretKey = "password"
+bindAddr = "127.0.0.1"
+bindPort = 6000
+```
+
+### stcp端口转发
+
+对于最简单的tcp转发模式，会直接将转发端口暴露在公网上，存在被扫描以及攻击的可能性，所以提出了一种更安全的stcp转发模式。该模式下只有在visitor端的frpc请求连接后才会在内部打通请求
+
+```toml
+# frps.toml
+bindPort = 7000
+```
+
+```toml
+# frpc_provider.toml
+[[proxies]]
+name = "stcp_proxy"
+type = "stcp"
+secretKey = "password"
+localIP = "127.0.0.1"
+localPort = 22
+```
+
+```toml
+# frpc_visitor.toml
+[[visitors]]
+name = "stcp_proxy_visitor"
+type = "stcp"
+serverName = "stcp_proxy"
+secretKey = "password"
+bindAddr = "127.0.0.1"
+bindPort = 6000
+```
+
+## OpenVPN
+
+OpenVPN 的本质是利用 **OpenSSL** 库来处理加密。它的工作逻辑和我们访问 HTTPS 网站非常相似。
+
+**身份验证：** 它是基于 **证书体系 (PKI)** 的。服务端有一个 CA 根证书，每个客户端都有自己的证书和私钥。只有被 CA 签名的证书才能通过验证。
+
+**虚拟网卡：** OpenVPN 在系统层创建虚拟网卡（TUN 或 TAP 设备）。（一般VPN软件都会创建一个虚拟网卡
+
+**TCP/UDP 切换：** 默认跑在 UDP 1194 端口追求速度。但如果网络环境封锁了 UDP，它可以伪装成 **TCP 443 端口**。
+
+**HTTPS 伪装：** 在外表看来，它的流量和普通的网页浏览流量非常接近，很难被简单的防火墙规则直接切断。
+
+在服务端部署好OpenVPN之后会生成一份`.ovpn`文件，在客户端使用该份配置文件即可连接上服务端构建的虚拟局域网
+
+## WireGuard
+
+WireGuard同样也是一个VPN协议，和OpenVPN完全不一样。
+
+前面所描述的OpenVPN的身份认证体系是依赖于服务端签发的证书，用于和客户端校验，会发现这里的证书和客户端是没有强关联的。
+
+而WireGuard中采用了独立的公私钥对，每一个客户端会和服务端采用一对独立的公私钥，同时服务端也依赖公私钥对的关系建立客户端的索引
+
+同时WireGuard的配置会比OpenVPN更简单，只需要确定好对应的公私钥即可
+
+```toml
+# wg0.conf
+[Interface]
+PrivateKey = <服务端的私钥>
+Address = 10.0.0.1/24
+ListenPort = 51820
+
+[Peer]
+# peer1
+PublicKey = <客户端 1 的公钥>
+AllowedIPs = 10.0.0.2/32
+
+[Peer]
+# peer2
+PublicKey = <客户端 2 的公钥>
+AllowedIPs = 10.0.0.3/32
+
+[Peer]
+# peer3
+...
+```
+
+```toml
+# peer1.conf
+[Interface]
+PrivateKey = <客户端 1 的私钥>
+Address = 10.0.0.2/24
+ListenPort = 51820
+
+[Peer]
+PublicKey = <服务端的公钥>
+Endpoint = x.x.x.x:51820
+AllowedIPs = 10.0.0.0/24
+```
+
+```toml
+# peer2.conf
+[Interface]
+PrivateKey = <客户端 2 的私钥>
+Address = 10.0.0.3/24
+ListenPort = 51820
+
+[Peer]
+PublicKey = <服务端的公钥>
+Endpoint = x.x.x.x:51820
+AllowedIPs = 10.0.0.0/24
+```
+
+然后这几台设备就在`10.0.0.0/24`这个网段中可以相互通信了
+
+> 1. **代理** 更像“某个应用程序的出口换了一条路”。
+> 
+> 2. **VPN** 更像“系统多了一张网卡，所有流量都可以走这张网卡”。
+> 
+> 所以如果你只是想让浏览器或某个命令走代理，通常不一定要上 VPN；但如果你想让远程桌面、文件共享、局域网发现这类东西都能正常工作，VPN 往往更自然。
+
+## TailScale
+
+Tailscale 是基于 WireGuard 协议构建的虚拟组网工具，在此基础上还实现了自动P2P打洞，从而绕过了中继服务器进行流量转发。如果多种打洞方式尝试失败后，会通过Tailscale的自己的中继服务器进行流量转发。
+
+## RadminVPN
+
+Radmin VPN是一个闭源的组网工具，免注册，无设备限制
+
+## CloudFlare WARP
+
+> 因为这个软件本身用途的特殊性，所以可以用做魔法工具
+
+CloudFlare WARP 是 Cloudflare 公司推出的一款基于 **WireGuard** 协议的软件
+
+WARP可以让你的所有请求通过最近的Cloudflare边缘服务器进行转发，从而隐藏真实的IP信息等。作用类似于代理服务器
+
+## Proxychains
+
+Proxychains 是 Linux 下的一个强制代理工具，可以强制将命令通过代理运行，而不关心这个命令是否支持代理。同时还可以对流量内容进行加密。此外还可以配置多个代理服务器构成的代理链，方便进行内网跳转
+
+`proxychains4 <command>`
+
+在该路径下是默认的 proxychains4 的配置文件 `/etc/proxychains4.conf` 
+
+```toml
+# proxychains4.conf
+[ProxyList]
+# 协议   IP地址       端口
+socks5  127.0.0.1   1080
+...
+```
+
+但是需要注意的是，这里 proxychains 不能和环境变量的配置共用，会出现请求同时经过proxychains和环境变量两个代理，会出现无法连接的情况
+
+更多使用内容可以看这篇博客 [https://seandictionary.top/proxychains4/](https://seandictionary.top/proxychains4/)
+
+## Proxifier
+
+Proxifier 可以看作是带GUI的 proxychains 在MAC，Windows上的实现。
+
+可以指定详细规则用于请求分流，也可以实现和 proxychains 一样的链式代理
+
+# 其他的一些碎碎念
+
+## 网络请求
+
+通常一个程序在联网时，大致流程如下：
+
+```toml
+应用程序
+↓
+socket API(connect/send/recv)
+↓
+操作系统网络栈(TCP/IP)
+↓
+路由
+↓
+网卡
+↓
+互联网
+```
+
+然后上述讲到的所有工具，都是在这个链路上的某一环进行截获，然后转发。区别在于在那一层截获
+
+例如
+
+Linux 的环境变量是读取环境变量
+
+Windows 系统代理是调用 WinINet/WinHTTP
+
+Proxychains 通过劫持 libc 的网络模块然后注入自己的 libproxychains.so
+
+Proxifier 也是和 Proxychains 类似，通过劫持软件的 socket 调用，然后强制走自己的代理链及规则分流
+
+其余的 VPN 工具更多的是 网络层隧道，而非应用层代理
+
+要注意的是有些不同的工具是全局代理，没有完整的规则分流，混用会造成代理链重合，出现一些无法访问的问题，例如 Proxychains 和系统环境变量同时使用
+
+## TUN/TAP
+
+TUN/TAP 本质就是一张虚拟网卡，和 Docker，WSL，VM 等等的网络配置类似，都会在本机插入一张虚拟网卡，然后通过软件处理网卡的请求。
+
+| **类型** | **工作层级** | **处理内容** |
+|-|-|-|
+| TUN | 三层（IP层） | IP 包 |
+| TAP | 二层（以太网层） | 以太网帧 |
+
+虚拟网卡会将接收到的数据包发送到用户态程序上例如 Clash，OpenVPN 等等。
+
+## 代理协议
+
+代理协议主要这几种，在 Linux 中设置环境变量的时候也能看到。  
+HTTP、HTTPS、SOCKS（SOCKS4，SOCKS5）
+
+前两者好理解，代理的是HTTP/HTTPS的流量，但是所有的通信过程并不只是包含这两类流量，例如后端、数据库等等的通信。
+
+所以 SOCKS 协议 是用来转发 UDP/TCP 流量的一个代理协议
+
+> `ssh -D` 转发使用的默认是 socks 协议，而 win 的系统代理更多的用的是 HTTP/HTTPS 协议（或许这就是TUN模式更好用的原因（？
+
+SOCKS4 不支持IPv6 不支持远程DNS 不支持UDP
