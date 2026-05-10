@@ -29,7 +29,9 @@
  *     hard-coded list: a file is owned by the script iff it has a
  *     `feishuToken:` field. Anything without one is left alone.
  *   - Embedded `<bitable token="..." />` blocks in a docx are replaced with
- *     a real markdown table fetched from the bitable's first table.
+ *     a real markdown table fetched from the bitable's first table, and
+ *     `<sheet token="..." sheet-id="..." />` blocks are replaced with the
+ *     used range of the named worksheet rendered as a markdown table.
  *
  * Special-cased nodes:
  *   - BITABLE_ARCHIVE_TOKEN still drives lib/data/share-records.json via
@@ -421,6 +423,124 @@ function renderBitableEmbed(token: string): string {
   }
 }
 
+/**
+ * Render an embedded `<sheet token="…" sheet-id="…" />` block as an inline
+ * markdown table by reading the named worksheet's used range. Errors degrade
+ * to a hint blockquote so a single broken embed doesn't block the whole sync.
+ */
+function renderSheetEmbed(token: string, sheetId: string): string {
+  try {
+    const info = larkJson([
+      "sheets",
+      "+info",
+      "--spreadsheet-token",
+      token,
+    ]) as {
+      data?: {
+        sheets?: {
+          sheets?: {
+            sheet_id: string;
+            title?: string;
+            grid_properties?: { row_count?: number; column_count?: number };
+          }[];
+        };
+      };
+    };
+    const sheets = info?.data?.sheets?.sheets ?? [];
+    const target = sheets.find((s) => s.sheet_id === sheetId);
+    if (!target) {
+      return `\n> 飞书电子表格 (token=${token}, sheet=${sheetId}) 找不到对应工作表\n`;
+    }
+    const rowCount = target.grid_properties?.row_count ?? 0;
+    const colCount = target.grid_properties?.column_count ?? 0;
+    if (rowCount === 0 || colCount === 0) {
+      return `\n> 飞书电子表格 (token=${token}, sheet=${sheetId}) 工作表为空\n`;
+    }
+    const range = `A1:${columnLetter(colCount)}${rowCount}`;
+    const resp = larkJson([
+      "sheets",
+      "+read",
+      "--spreadsheet-token",
+      token,
+      "--sheet-id",
+      sheetId,
+      "--range",
+      range,
+      "--value-render-option",
+      "ToString",
+    ]) as { data?: { valueRange?: { values?: unknown[][] } } };
+    const values = resp?.data?.valueRange?.values ?? [];
+    const md = renderSheetValuesAsMarkdown(values);
+    if (!md) {
+      return `\n> 飞书电子表格 (token=${token}, sheet=${sheetId}) 表内无数据\n`;
+    }
+    return `\n${md}\n`;
+  } catch (e) {
+    const msg = (e as Error).message.split("\n")[0];
+    return `\n> 飞书电子表格 (token=${token}, sheet=${sheetId}) 拉取失败: ${msg}\n`;
+  }
+}
+
+/** Convert 1-based column index → A1-style letters (1→A, 27→AA, …). */
+function columnLetter(n: number): string {
+  let s = "";
+  let x = n;
+  while (x > 0) {
+    const r = (x - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    x = Math.floor((x - 1) / 26);
+  }
+  return s;
+}
+
+/**
+ * Render a 2-D `+read` value matrix as a GFM table. Trims trailing empty
+ * rows/columns (Lark sheets pad to grid dimensions), uses the first row as
+ * the header, and escapes `|` / replaces newlines so cell content survives
+ * inside a single markdown row.
+ */
+function renderSheetValuesAsMarkdown(values: unknown[][]): string {
+  const isEmpty = (v: unknown) =>
+    v === null || v === undefined || (typeof v === "string" && v.trim() === "");
+  const formatCell = (v: unknown): string => {
+    if (v === null || v === undefined) return "";
+    let s: string;
+    if (typeof v === "string") s = v;
+    else if (typeof v === "number" || typeof v === "boolean") s = String(v);
+    else s = JSON.stringify(v);
+    return s.replace(/\|/g, "\\|").replace(/\r?\n/g, "<br/>").trim();
+  };
+
+  let lastRow = -1;
+  for (let i = 0; i < values.length; i++) {
+    if ((values[i] ?? []).some((v) => !isEmpty(v))) lastRow = i;
+  }
+  if (lastRow < 0) return "";
+  const rows = values.slice(0, lastRow + 1);
+
+  const widest = rows.reduce((m, r) => Math.max(m, r?.length ?? 0), 0);
+  let lastCol = -1;
+  for (let c = 0; c < widest; c++) {
+    if (rows.some((r) => !isEmpty(r?.[c]))) lastCol = c;
+  }
+  if (lastCol < 0) return "";
+  const cols = lastCol + 1;
+
+  const header = Array.from({ length: cols }, (_, c) =>
+    formatCell(rows[0]?.[c] ?? ""),
+  );
+  const out: string[] = [];
+  out.push(`| ${header.join(" | ")} |`);
+  out.push(`| ${header.map(() => "---").join(" | ")} |`);
+  for (let i = 1; i < rows.length; i++) {
+    const cells = Array.from({ length: cols }, (_, c) =>
+      formatCell(rows[i]?.[c] ?? ""),
+    );
+    out.push(`| ${cells.join(" | ")} |`);
+  }
+  return out.join("\n");
+}
+
 function sanitizeBitableMarkdown(rawTable: string): string {
   const lines = rawTable.split("\n");
   const out: string[] = [];
@@ -549,9 +669,11 @@ function transformDocxMarkdown(
   md = md.replace(/<folder_manager\s*>\s*<\/folder_manager>/g, "");
   md = md.replace(/<folder_manager\s*\/>/g, "");
 
-  // 6. Embedded bitable — render the first table as an inline markdown
-  //     table. Other embeds (sheet/whiteboard/mindnote/slides/file) stay as
-  //     a hint blockquote pointing at the original.
+  // 6. Embedded bitable / sheet — render as an inline markdown table:
+  //     `<bitable>` pulls the first table; `<sheet>` pulls the worksheet
+  //     pinned by the `sheet-id` attribute (the embed knows exactly which
+  //     tab to show). Other embeds (whiteboard/mindnote/slides/file) stay
+  //     as a hint blockquote pointing at the original.
   md = md.replace(/<bitable\b([^>]*?)\/>/g, (_match, attrs: string) => {
     const token = extractAttr(attrs, "token");
     if (!token) return "\n> 飞书多维表格嵌入块缺少 token\n";
@@ -565,13 +687,22 @@ function transformDocxMarkdown(
       return renderBitableEmbed(token);
     },
   );
+  const sheetReplacer = (_match: string, attrs: string): string => {
+    const token = extractAttr(attrs, "token");
+    const sheetId = extractAttr(attrs, "sheet-id");
+    if (!token || !sheetId)
+      return "\n> 飞书电子表格嵌入块缺少 token 或 sheet-id\n";
+    return renderSheetEmbed(token, sheetId);
+  };
+  md = md.replace(/<sheet\b([^>]*?)\/>/g, sheetReplacer);
+  md = md.replace(/<sheet\b([^>]*?)>[\s\S]*?<\/sheet>/g, sheetReplacer);
   md = md.replace(
-    /<(sheet|whiteboard|mindnote|slides|file)\b[^>]*\/>/g,
+    /<(whiteboard|mindnote|slides|file)\b[^>]*\/>/g,
     (_match, kind: string) =>
       `\n> 飞书 ${kind} 嵌入块未在静态站点渲染，请[查看飞书原文](#)。\n`,
   );
   md = md.replace(
-    /<(sheet|whiteboard|mindnote|slides|file)\b[^>]*>[\s\S]*?<\/\1>/g,
+    /<(whiteboard|mindnote|slides|file)\b[^>]*>[\s\S]*?<\/\1>/g,
     (_match, kind: string) =>
       `\n> 飞书 ${kind} 嵌入块未在静态站点渲染，请[查看飞书原文](#)。\n`,
   );
