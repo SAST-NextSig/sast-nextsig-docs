@@ -1,0 +1,245 @@
+---
+title: 组件速查
+description: 这个站点能用的 MDX 组件、代码块语法与样式总览
+tags: [参考, 组件, MDX]
+---
+
+import { Accordion, Accordions } from 'fumadocs-ui/components/accordion';
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { File, Files, Folder } from 'fumadocs-ui/components/files';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+import { TypeTable } from 'fumadocs-ui/components/type-table';
+import { BookIcon, RocketIcon, ZapIcon } from 'lucide-react';
+
+> 这一页用来快速对照本站可用的 MDX 组件与代码块写法。
+> 写新文档时直接复制片段即可。
+
+## Callout
+
+四种语义颜色，常用于警告与提示。
+
+<Callout type="info" title="信息">这是一段信息提示。</Callout>
+<Callout type="warn" title="注意">这是一段需要警觉的提示。</Callout>
+<Callout type="error" title="错误">出错了，先回到上一页吧。</Callout>
+<Callout type="success" title="完成">操作成功。</Callout>
+
+## Tabs
+
+在页面里切换不同写法或语言。
+
+<Tabs items={['React', 'Vue', 'Svelte']}>
+  <Tab>React 用 `useState` 管理本地状态。</Tab>
+  <Tab>Vue 3 推荐 `ref()` / `reactive()`。</Tab>
+  <Tab>Svelte 直接 `let count = 0;` 配合 `$:` 响应式。</Tab>
+</Tabs>
+
+## Steps
+
+分步骤教程，自带圆形数字。
+
+<Steps>
+<Step>
+
+### 安装依赖
+
+```bash
+pnpm install
+```
+
+</Step>
+<Step>
+
+### 同步飞书内容
+
+```bash
+pnpm sync:lark
+```
+
+</Step>
+<Step>
+
+### 启动开发服务器
+
+```bash
+NODE_OPTIONS="--max-old-space-size=8192" pnpm dev
+```
+
+</Step>
+</Steps>
+
+## Cards
+
+引导用户进入下一站，支持 icon / description / 外链。
+
+<Cards>
+  <Card icon={<BookIcon />} title="文档首页" href="/docs" description="一切从这里开始。" />
+  <Card icon={<RocketIcon />} title="第一次分享会" href="/docs/first-meeting" description="四篇深度内容。" />
+  <Card icon={<ZapIcon />} title="飞书 Wiki" href="https://njupt-sast.feishu.cn/wiki/space/7625304658956799168" description="未经裁剪的原始内容（外链）。" external />
+</Cards>
+
+## Files
+
+可视化展示目录结构，适合"项目长这样"这类介绍。
+
+<Files>
+  <Folder name="content" defaultOpen>
+    <Folder name="docs">
+      <File name="index.mdx" />
+      <File name="getting-started.mdx" />
+      <Folder name="first-meeting">
+        <File name="index.mdx" />
+        <File name="context-engineering.mdx" />
+      </Folder>
+    </Folder>
+  </Folder>
+  <Folder name="scripts">
+    <File name="sync-from-lark.ts" />
+  </Folder>
+</Files>
+
+## Accordion
+
+折叠常见问题或冗长说明。
+
+<Accordions type="single">
+<Accordion title="为什么要从飞书同步而不是直接写在 git 里？">
+  分享者主要在飞书写作，飞书的协作体验比 git 好很多。
+  本站只负责把飞书内容公开成结构化、可搜索的文档。
+</Accordion>
+<Accordion title="同步是定时跑还是手动跑？">
+  目前是手动跑：`pnpm sync:lark`。脚本是幂等的，
+  手写页面（landing / 第一次分享会的索引页等）会被保留。
+</Accordion>
+<Accordion title="bitable 表格能实时刷新吗？">
+  本次只导出当下快照。要更新 archive 页就再跑一次同步。
+</Accordion>
+</Accordions>
+
+## TypeTable
+
+API 参数表，常配合 TS 类型一起出现。
+
+<TypeTable
+  type={{
+    title: { type: 'string', required: true, description: '页面标题，会出现在浏览器 tab 与 og:title。' },
+    description: { type: 'string', description: 'meta description，影响 SEO。' },
+    feishuToken: { type: 'string', default: 'undefined', description: '同步时来自飞书的 obj_token。' },
+    lastSyncedAt: { type: 'string (ISO 8601)', description: '上次同步时间。' },
+  }}
+/>
+
+## 代码块标注
+
+借助 Shiki transformer，可以在围栏代码块里直接写 `[!code highlight]` 等注释。
+
+```ts title="example.ts"
+function greet(name: string) {
+  console.log("hi"); // [!code --]
+  console.log(`你好，${name}`); // [!code ++]
+  return name.toUpperCase(); // [!code highlight]
+}
+```
+
+聚焦某一段（其他行模糊）：
+
+```ts
+const a = 1;
+const b = 2; // [!code focus]
+const c = 3; // [!code focus]
+const d = 4;
+```
+
+## 包管理器自动 Tab
+
+围栏语言写 `npm`，构建时自动展开为 npm / pnpm / yarn / bun 四个 Tab，且选择会跨页面记住。
+
+```npm
+npm install fumadocs-ui
+```
+
+## 数学公式
+
+行内：当 $n \to \infty$，调和级数 $\sum_{k=1}^{n} \frac{1}{k}$ 趋向无穷。
+
+块级：
+
+$$
+\hat{f}(\xi) = \int_{-\infty}^{\infty} f(x)\, e^{-2\pi i x \xi}\, \mathrm{d}x
+$$
+
+## Mermaid 图
+
+```mermaid
+flowchart LR
+  A[飞书 Wiki] -->|sync 脚本| B[content/docs/*.mdx]
+  B -->|fumadocs-mdx| C[.source 编译产物]
+  C --> D[Next.js App Router]
+  D --> E((你看到的页面))
+```
+
+## 数据图表（Recharts）
+
+适合在分享会数据、调研结果、项目趋势这类场景用。组件位于 `components/charts/examples.tsx`，作者写自己的图表时可参考它们。
+
+### 折线图：访问 / 注册增长
+
+<LineChartDemo />
+
+### 柱图：分享会主题分布
+
+<BarChartDemo />
+
+### 饼图：主题占比
+
+<PieChartDemo />
+
+### 面积图：每月提交
+
+<AreaChartDemo />
+
+### 雷达图：兴趣维度
+
+<RadarChartDemo />
+
+## TypeScript Twoslash
+
+代码块语言后加 `twoslash` 即可触发悬浮类型提示。鼠标停在标识符上能看到推断出的类型，`// ^?` 还会就地展开。
+
+```ts twoslash
+// 来自 lib/shared.ts
+const gitConfig = {
+  user: 'NJUPT-SAST',
+  repo: 'sast-nextsig-docs',
+  branch: 'master',
+} as const;
+
+type GitUser = typeof gitConfig.user;
+//   ^?
+
+function repoUrl(c: typeof gitConfig) {
+  return `https://github.com/${c.user}/${c.repo}`;
+}
+
+const url = repoUrl(gitConfig);
+//    ^?
+```
+
+## 内嵌 TOC
+
+文档非常长时可以在中段插一个内嵌目录，让读者快速跳转。
+
+```mdx
+import { InlineTOC } from 'fumadocs-ui/components/inline-toc';
+
+<InlineTOC items={toc} />
+```
+
+## ImageZoom
+
+所有 Markdown 图片都被自动包成可点击放大的形式。
+
+```md
+![Cloudflare Tunnel 示意](/lark-media/example.png)
+```

@@ -1,0 +1,14 @@
+{
+  "title": "SAST Next Sig",
+  "description": "南京邮电大学 SAST 的分享会知识库",
+  "pages": [
+    "index",
+    "getting-started",
+    "---分享会---",
+    "first-meeting",
+    "second-meeting",
+    "---资料---",
+    "archive",
+    "components"
+  ]
+}

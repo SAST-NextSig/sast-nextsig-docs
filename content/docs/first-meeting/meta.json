@@ -1,0 +1,12 @@
+{
+  "title": "第一次分享会",
+  "description": "AI 编程工具链 + 网络与代理",
+  "defaultOpen": true,
+  "pages": [
+    "index",
+    "context-engineering",
+    "claude-code-getting-started",
+    "cloudflare-tunnel-deployment",
+    "why-proxy-traffic-gets-detected"
+  ]
+}

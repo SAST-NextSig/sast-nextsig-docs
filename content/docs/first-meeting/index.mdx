@@ -1,0 +1,52 @@
+---
+title: 第一次分享会
+description: 四篇深度内容 —— 代理流量检测、上下文工程、Claude Code、Cloudflare Tunnel
+tags: [分享会, AI, 网络]
+---
+
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+第一次分享会聚焦"AI 编程工具链 + 网络与代理"两条主线，四位分享者各自从一个角度切入。
+
+## 推荐阅读顺序
+
+<Steps>
+<Step>
+
+### 先理解"上下文工程"
+
+[上下文工程](/docs/first-meeting/context-engineering) 拆解了 Claude Code 内部的 prompt 分层、compact 机制、queryloop —— 知道 AI 编程工具是怎么"看到"你的代码后，再用它会更顺。
+
+</Step>
+<Step>
+
+### 上手 Claude Code
+
+[Claude Code 入门指南](/docs/first-meeting/claude-code-getting-started) 是最长的一篇，覆盖安装、工作流、自定义 MCP、hooks 等全套实践。
+
+</Step>
+<Step>
+
+### 部署你自己的内网服务
+
+[Cloudflare Tunnel Deployment](/docs/first-meeting/cloudflare-tunnel-deployment) 不用公网 IP 就能把本地服务暴露到互联网，配合域名解析五分钟搞定。
+
+</Step>
+<Step>
+
+### 理解流量为什么被检测
+
+[Why Proxy Traffic Gets Detected](/docs/first-meeting/why-proxy-traffic-gets-detected) 从协议特征、握手形态到 SNI、QUIC，说清"密文藏住后还剩什么"。
+
+</Step>
+</Steps>
+
+## 直达每篇
+
+<Cards>
+  <Card title="上下文工程" href="/docs/first-meeting/context-engineering" description="From io-wy · Claude Code 2.1.87 · queryloop / compact / prompt 分层" />
+  <Card title="Claude Code 入门指南" href="/docs/first-meeting/claude-code-getting-started" description="From Max · 从工具到工作流的 AI 编程新范式" />
+  <Card title="Cloudflare Tunnel Deployment" href="/docs/first-meeting/cloudflare-tunnel-deployment" description="From Pt · 内网穿透 · NAT · Nginx · 反向代理" />
+  <Card title="Why Proxy Traffic Gets Detected" href="/docs/first-meeting/why-proxy-traffic-gets-detected" description="From s3loy · 流量检测流水线、TLS 握手、QUIC、产品画像" />
+</Cards>

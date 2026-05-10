@@ -1,0 +1,55 @@
+{
+  "updatedAt": "2026-05-10T01:59:13.910Z",
+  "records": [
+    {
+      "speaker": "Max Qian",
+      "date": "2026-04-11",
+      "title": "Tool Use",
+      "link": {
+        "text": "Claude Code 入门指南：从工具到工作流的 AI 编程新范式",
+        "url": "https://njupt-sast.feishu.cn/docx/URn6d91FYopnIRxMN9YcWa7yn1b?from=from_copylink"
+      }
+    },
+    {
+      "speaker": "io-wy",
+      "date": "2026-04-11",
+      "title": "Agent Context",
+      "link": {
+        "text": "io-wy.github.io/blog/%E4%B8%8A%E4%B8%8B%E6%96%87%E5%B7%A5%E7%A8%8B/",
+        "url": "https://io-wy.github.io/blog/%E4%B8%8A%E4%B8%8B%E6%96%87%E5%B7%A5%E7%A8%8B/"
+      }
+    },
+    {
+      "speaker": "s3loy",
+      "date": "2026-04-11",
+      "title": "Proxy- Traffic-Gets-Detected",
+      "link": {
+        "text": "blog.s3loy.tech/posts/why-proxy-traffic-gets-detected/",
+        "url": "https://blog.s3loy.tech/posts/why-proxy-traffic-gets-detected/"
+      }
+    },
+    {
+      "speaker": "Ptilopsis",
+      "date": "2026-04-11",
+      "title": "Network Tunnel",
+      "link": {
+        "text": "Cloudflare Tunnel Deployment · Pt's Blog",
+        "url": "https://blog.ptilopsis.cv/posts/cloudflare-tunnel-deployment/"
+      }
+    },
+    {
+      "speaker": "cube",
+      "date": "2026-05-10",
+      "title": "Operation System",
+      "link": {
+        "text": "漫谈os（一）：GPOS下的进程管理",
+        "url": "https://njupt-sast.feishu.cn/wiki/Bvs1wVBKYioC3kkn4APcJ32JnSh?from=from_copylink"
+      }
+    },
+    {
+      "speaker": "sean",
+      "date": "2026-05-10",
+      "title": "NAT Traversal & Virtual Networking"
+    }
+  ]
+}
