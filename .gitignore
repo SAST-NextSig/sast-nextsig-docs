@@ -30,3 +30,6 @@ next-env.d.ts
 verify-*.png
 
 .claude/scheduled_tasks.lock
+
+.vercel
+.env*.local
