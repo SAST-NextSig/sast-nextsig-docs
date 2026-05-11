@@ -50,7 +50,7 @@ export function AISearchPanelHeader({
       <div className="px-3 py-2 flex-1">
         <p className="text-sm font-medium mb-2">问问 NextSig 助手</p>
         <p className="text-xs text-fd-muted-foreground">
-          AI 回答可能有误，请以原始文档为准。
+          AI 回答可能有误，请以原始文档为准喵
         </p>
       </div>
 
